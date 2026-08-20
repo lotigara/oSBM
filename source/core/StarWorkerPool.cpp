@@ -1,6 +1,7 @@
 #include "StarWorkerPool.hpp"
 #include "StarIterator.hpp"
 #include "StarMathCommon.hpp"
+#include "StarMemoryUsage.hpp"
 
 namespace Star {
 
@@ -102,6 +103,11 @@ void WorkerPool::finish() {
   stop();
 }
 
+void WorkerPool::releaseThreadCaches() {
+  MutexLocker workLock(m_workMutex);
+  m_workCondition.broadcast();
+}
+
 WorkerPoolHandle WorkerPool::addWork(function<void()> work) {
   // Construct a worker pool handle and wrap the work to signal the handle when
   // finished.  Set the result to empty string if successful and to the content
@@ -143,6 +149,7 @@ void WorkerPool::WorkerThread::run() {
       break;
 
     if (parent->m_pendingWork.empty()) {
+      memoryReleaseThreadCaches();
       waiting = true;
       parent->m_workCondition.wait(parent->m_workMutex);
       waiting = false;

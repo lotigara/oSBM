@@ -775,6 +775,10 @@ void Assets::clearCache() {
     if (pair.second && !pair.second->shouldPersist() && !m_queue.contains(pair.first))
       it.remove();
   }
+
+  // Freed assets return to the worker heap that loaded them. Wake those
+  // workers so deferred frees are adopted and empty spans reach the OS.
+  m_assetsQueued.broadcast();
 }
 
 void Assets::cleanup() {
@@ -856,6 +860,14 @@ void Assets::cleanup() {
   }
 
   memoryAccountSet(MemoryCategory::AssetCache, totalBytes);
+
+  bool evicted = !doomed.empty();
+  assetsLocker.unlock();
+  doomed.clear();
+  if (evicted) {
+    assetsLocker.lock();
+    m_assetsQueued.broadcast();
+  }
 }
 
 bool Assets::AssetId::operator==(AssetId const& assetId) const {
@@ -1119,6 +1131,7 @@ void Assets::workerMain() {
 
     if (queuePriority != QueuePriority::Load && queuePriority != QueuePriority::PostProcess) {
       // Nothing in the queue that needs work
+      memoryReleaseThreadCaches();
       m_assetsQueued.wait(m_assetsMutex);
       continue;
     }

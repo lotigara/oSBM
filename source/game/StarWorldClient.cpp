@@ -114,15 +114,6 @@ WorldClient::WorldClient(PlayerPtr mainPlayer, LuaRootPtr luaRoot) {
 
 WorldClient::~WorldClient() {
   worldClientLiveCount().fetch_sub(1, std::memory_order_relaxed);
-  if (m_lightingThread) {
-    m_stopLightingThread = true;
-    {
-      MutexLocker locker(m_lightingMutex);
-      m_lightingCond.broadcast();
-    }
-
-    m_lightingThread.finish();
-  }
   clearWorld();
 }
 
@@ -2242,7 +2233,8 @@ void WorldClient::lightingCalc() {
 void WorldClient::lightingMain() {
   MutexLocker condLocker(m_lightingMutex);
   while (true) {
-    m_lightingCond.wait(m_lightingMutex);
+    while (!m_stopLightingThread && !m_pendingLightReady.load())
+      m_lightingCond.wait(m_lightingMutex);
     if (m_stopLightingThread)
       return;
 
@@ -2358,6 +2350,17 @@ void WorldClient::initWorld(WorldStartPacket const& startPacket) {
 void WorldClient::clearWorld() {
   MemoryDomain memoryDomain(m_memoryHeap);
   bool wasInWorld = m_inWorld;
+
+  if (m_lightingThread) {
+    m_stopLightingThread = true;
+    {
+      MutexLocker locker(m_lightingMutex);
+      m_lightingCond.broadcast();
+    }
+    m_lightingThread.finish();
+    m_lightingThread = {};
+    m_stopLightingThread = false;
+  }
 
   if (m_entityMap) {
     while (m_entityMap->size() > 0) {

@@ -2329,6 +2329,11 @@ void ClientApplication::flushGpuAfterWorldLeave() {
   auto worldClient = m_universeClient ? m_universeClient->worldClient() : WorldClientPtr();
   if (!worldClient || !worldClient->pullWorldCleared())
     return;
+#ifdef STAR_SYSTEM_SWITCH
+  // End the per-world update worker so its deferred frees and stack return
+  // before loading the next world.
+  stopSimThread();
+#endif
   if (m_worldPainter)
     m_worldPainter->cleanup(0);
   Logger::info("ClientApplication: flushed world GPU caches after world leave");

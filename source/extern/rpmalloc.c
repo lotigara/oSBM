@@ -107,11 +107,19 @@ extern void starAllocProfileUntrackC(void* pointer);
 // 151MB parked in per-thread span caches after returning to the ship -- memory
 // that is FREE but that rpmalloc_release_caches() cannot reach, because it can
 // only drain the calling thread's heap plus the global cache. Capping the
-// per-thread cache pushes those spans out to the global cache, which the
-// release path does drain.
+// per-thread cache pushes those spans to Android's bounded global cache; on
+// Switch, where the global cache is disabled below, overflow unmaps directly.
 //
 // MAX_THREAD_SPAN_LARGE_CACHE must stay above LARGE_CLASS_COUNT/2 (=32) or the
 // large-span limit goes negative, so it can only come down slightly.
+#if defined(__SWITCH__)
+// newlib cannot decommit rpmalloc subspans. With the stock 64-span (4MB)
+// mapping, one surviving allocation pins the whole group; repeated outpost
+// warps retained ~400MB per cycle. Map spans independently and do not move
+// empty spans into another cache so each one can return to newlib immediately.
+#define DEFAULT_SPAN_MAP_COUNT      1
+#define ENABLE_GLOBAL_CACHE         0
+#endif
 #if defined(__SWITCH__) || defined(STAR_SYSTEM_ANDROID)
 #define MAX_THREAD_SPAN_CACHE        32
 #define THREAD_SPAN_CACHE_TRANSFER    8
@@ -1018,7 +1026,13 @@ _rpmalloc_unmap(void* address, size_t size, size_t offset, size_t release) {
 static void*
 _rpmalloc_mmap_os(size_t size, size_t* offset) {
 	//Either size is a heap (a single page) or a (multiple) span - we only need to align spans, and only if larger than map granularity
+#if defined(__SWITCH__)
+	// memalign already supplies span alignment. Extra padding would double a
+	// one-span mapping and serves no purpose on the newlib-backed Switch heap.
+	size_t padding = 0;
+#else
 	size_t padding = ((size >= _memory_span_size) && (_memory_span_size > _memory_map_granularity)) ? _memory_span_size : 0;
+#endif
 	rpmalloc_assert(size >= _memory_page_size, "Invalid mmap size");
 #if PLATFORM_WINDOWS
 	//Ok to MEM_COMMIT - according to MSDN, "actual physical pages are not allocated unless/until the virtual addresses are actually accessed"
@@ -1048,10 +1062,11 @@ _rpmalloc_mmap_os(size_t size, size_t* offset) {
 		//  it. Safe to call here: mmap is never invoked while a span-cache lock
 		//  is held, and releasing only unmaps spans that are already free.
 		extern size_t rpmalloc_release_caches(void);
-		if (rpmalloc_release_caches())
+		if (rpmalloc_release_caches()) {
 			ptr = memalign(align, size + padding);
 			if (ptr)
 				atomic_add64(&_star_mapped_bytes, (int64_t)(size + padding));
+		}
 	}
 	if (!ptr) {
 		//  Loud failure: distinguishing heap exhaustion from other faults is
@@ -3464,12 +3479,14 @@ rpmalloc_occupancy_report(char* buffer, size_t buffer_size) {
 	// of a 551MB gap between rpmapped and everything this report could account
 	// for.
 	size_t global_cache_bytes = 0;
+#if ENABLE_GLOBAL_CACHE
 	for (size_t iclass = 0; iclass < LARGE_CLASS_COUNT; ++iclass) {
 		global_cache_t* gc = &_memory_span_cache[iclass];
 		global_cache_bytes += (size_t)gc->count * (iclass + 1) * _memory_span_size;
 		for (span_t* sp = gc->overflow; sp; sp = sp->next)
 			global_cache_bytes += (size_t)sp->span_count * _memory_span_size;
 	}
+#endif
 	size_t reserved_bytes = (size_t)_memory_global_reserve_count * _memory_span_size;
 	for (size_t list_idx = 0; list_idx < HEAP_ARRAY_SIZE; ++list_idx) {
 		heap_t* heap = _memory_heaps[list_idx];

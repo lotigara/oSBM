@@ -1318,8 +1318,9 @@ void UniverseServer::shutdownInactiveWorlds() {
         }
 
         m_worlds.remove(worldId);
-        // Leave allocator-cache unmap to the maintenance sweep: the arriving
-        // world may already be allocating on another thread.
+        // World construction runs in this pool. Destruction on the world
+        // thread leaves cross-thread frees queued on a pool worker.
+        m_workerPool.releaseThreadCaches();
         // Once a world is shutdown, mark its shutdown time in m_tempWorldIndex
         if (auto instanceWorldId = worldId.maybe<InstanceWorldId>()) {
           if (m_tempWorldIndex.contains(*instanceWorldId))

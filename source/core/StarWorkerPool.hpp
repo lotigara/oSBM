@@ -109,6 +109,9 @@ public:
   // eventually become empty for this to properly return.
   void finish();
 
+  // Wake idle workers so they can return their per-thread allocator caches.
+  void releaseThreadCaches();
+
   // Add the given work to the pool and return a handle for the work.  It not
   // required that the caller of this method hold on to the worker handle, the
   // work will be managed and completed regardless of the WorkerPoolHandle
