@@ -318,6 +318,8 @@ void ClientWeather::setup(WorldGeometry worldGeometry, WeatherEffectsActiveQuery
   m_worldGeometry = worldGeometry;
   m_weatherEffectsActiveQuery = weatherEffectsActiveQuery;
   m_currentTime = 0.0;
+  m_particles.clear();
+  m_lastParticleVisibleRegion = {};
 }
 
 void ClientWeather::readUpdate(ByteArray data, NetCompatibilityRules rules) {

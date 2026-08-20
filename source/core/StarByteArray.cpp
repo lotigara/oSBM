@@ -1,4 +1,5 @@
 #include "StarByteArray.hpp"
+#include "StarMemory.hpp"
 #include "StarEncode.hpp"
 
 namespace Star {
@@ -89,7 +90,11 @@ void ByteArray::reserve(size_t newCapacity) {
       m_data = newMem;
       m_capacity = newCapacity;
     } else {
-      newCapacity = max({m_capacity * 2, newCapacity, (size_t)8});
+      // Doubling lands on exact powers of two, which are the worst possible
+      // sizes for a span allocator: 64KB needs 64KB+header and so costs two
+      // 64KB spans. Snap the (discretionary) doubled target to a size that
+      // fills its spans exactly; never below what the caller asked for.
+      newCapacity = spanFriendlyCapacity(max({m_capacity * 2, newCapacity, (size_t)8}), newCapacity);
       auto newMem = (char*)Star::realloc(m_data, newCapacity);
       if (!newMem)
         throw MemoryException::format("Could not set new ByteArray capacity {}\n", newCapacity);

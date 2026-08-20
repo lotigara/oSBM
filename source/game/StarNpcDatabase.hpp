@@ -84,7 +84,7 @@ private:
 
   RebuilderPtr m_rebuilder;
 
-  StringMap<Json> m_npcTypes;
+  JsonObject m_npcTypes;
 };
 
 }

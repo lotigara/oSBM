@@ -22,11 +22,11 @@ StatusController::StatusController(Json const& config) : m_statCollection(config
   m_statusProperties.setOverrides(
     [&](DataStream& ds, NetCompatibilityRules rules) {
       if (rules.version() <= 1) ds << m_statusProperties.baseMap();
-      else m_statusProperties.NetElementHashMap<String, Json>::netStore(ds, rules);
+      else m_statusProperties.NetElementMapWrapper<JsonObject>::netStore(ds, rules);
     },
     [&](DataStream& ds, NetCompatibilityRules rules) {
       if (rules.version() <= 1) m_statusProperties.reset(ds.read<JsonObject>());
-      else m_statusProperties.NetElementHashMap<String, Json>::netLoad(ds, rules);
+      else m_statusProperties.NetElementMapWrapper<JsonObject>::netLoad(ds, rules);
     },
     [&](DataStream& ds, uint64_t fromVersion, NetCompatibilityRules rules) {
       if (rules.version() <= 1) {
@@ -36,11 +36,11 @@ StatusController::StatusController(Json const& config) : m_statCollection(config
         }
         return false;
       }
-      return m_statusProperties.NetElementHashMap<String, Json>::writeNetDelta(ds, fromVersion, rules);
+      return m_statusProperties.NetElementMapWrapper<JsonObject>::writeNetDelta(ds, fromVersion, rules);
     },
     [&](DataStream& ds, float interp, NetCompatibilityRules rules) {
       if (rules.version() <= 1) m_statusProperties.reset(ds.read<JsonObject>());
-      else m_statusProperties.NetElementHashMap<String, Json>::readNetDelta(ds, interp, rules);
+      else m_statusProperties.NetElementMapWrapper<JsonObject>::readNetDelta(ds, interp, rules);
     }
   );
 

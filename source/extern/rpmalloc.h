@@ -220,6 +220,44 @@ rpmalloc_thread_finalize(int release_caches);
 RPMALLOC_EXPORT void
 rpmalloc_thread_collect(void);
 
+//! Release cached free spans back to the OS (oSBM addition).
+//
+// rpmalloc normally keeps freed spans in its thread and global caches so the
+// next allocation is cheap, and never returns them to the underlying
+// allocator. On a fixed-budget console that is invisible hoarding: measured on
+// Switch hardware, freeing 157MB of engine data returned 1MB to the system
+// heap -- the rest sat in these caches while the process approached its
+// ~3.2GB ceiling and world loads began to fail.
+//
+// Call this when the process is near its memory limit. It unmaps the calling
+// thread's cached spans and the global cache outright rather than recycling
+// them, so the memory becomes available to other subsystems (notably the GL
+// driver, which allocates from the same heap on Switch). Returns the number of
+// bytes released. Costs a lock per size class plus the unmaps, so it belongs
+// on a pressure path, not a hot one.
+// thread's cached spans only. Safe while other threads allocate.
+RPMALLOC_EXPORT size_t
+rpmalloc_release_thread_caches(void);
+
+//! Unmap the calling thread's cached spans AND the global cache. Only safe
+//  when no other thread is allocating from rpmalloc (e.g. after fullyLoad
+//  workers have joined).
+RPMALLOC_EXPORT size_t
+rpmalloc_release_caches(void);
+
+//! Bytes rpmalloc currently holds from the system heap. Subtracting this from
+// mallinfo()'s used figure gives what was allocated directly against newlib --
+// on Switch that is the mesa/nouveau GL driver and libnx, which no engine-level
+// profiler can see.
+RPMALLOC_EXPORT size_t
+rpmalloc_mapped_bytes(void);
+
+//! Per-size-class occupancy summary (ENABLE_STATISTICS builds only). Says
+// whether the process size is live data or spans pinned at low occupancy, and
+// names the size classes responsible.
+RPMALLOC_EXPORT void
+rpmalloc_occupancy_report(char* buffer, size_t buffer_size);
+
 //! Query if allocator is initialized for calling thread
 RPMALLOC_EXPORT int
 rpmalloc_is_thread_initialized(void);

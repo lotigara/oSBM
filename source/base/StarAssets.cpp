@@ -11,6 +11,7 @@
 #include "StarIterator.hpp"
 #include "StarImageProcessing.hpp"
 #include "StarLogging.hpp"
+#include "StarMemoryUsage.hpp"
 #include "StarRandom.hpp"
 #include "StarFont.hpp"
 #include "StarAudio.hpp"
@@ -777,25 +778,84 @@ void Assets::clearCache() {
 }
 
 void Assets::cleanup() {
+  // Declared BEFORE the locker so it outlives it: evicted entries are moved in
+  // here and destroyed only once the mutex is released. Freeing a sweep's worth
+  // of decompressed images while holding the assets mutex blocks every loader,
+  // the render thread and the sim thread, and measured as the spikes in
+  // [perf-maint] (up to 113ms). Locals destruct in reverse declaration order,
+  // so this runs after assetsLocker unlocks.
+  List<shared_ptr<AssetData>> doomed;
+
   MutexLocker assetsLocker(m_assetsMutex);
 
   double time = Time::monotonicTime();
+
+  // This whole function runs under the assets mutex that every loader thread
+  // needs, so its cost lands on the game as a periodic hitch. Sizing the
+  // surviving entries costs one virtual call each on a pass we already make,
+  // but building the eviction list allocates per entry -- with a big mod pack
+  // that is hundreds of thousands of appends. So pass 1 stays allocation-free
+  // and the list is only built in the rare sweep that is actually over budget.
+  uint64_t totalBytes = 0;
+
+  // Hashing an AssetId means hashing three strings, and m_queue.contains() was
+  // doing that for every cache entry on every sweep -- while the load queue is
+  // empty for essentially all of normal play. Checking that once turns the
+  // common sweep from "hash the whole cache" into a pointer walk.
+  bool queueEmpty = m_queue.empty();
 
   auto it = makeSMutableMapIterator(m_assetsCache);
   while (it.hasNext()) {
     auto pair = it.next();
     // Don't clean up broken assets or queued assets.
-    if (pair.second && !m_queue.contains(pair.first)) {
+    if (pair.second && (queueEmpty || !m_queue.contains(pair.first))) {
       double liveTime = time - pair.second->time;
+      // shouldPersist() is a virtual call plus a refcount read, and only the
+      // expired minority of entries need the answer.
       if (liveTime > m_settings.assetTimeToLive) {
         // If the asset should persist, just refresh the access time.
         if (pair.second->shouldPersist())
           pair.second->time = time;
-        else
+        else {
+          doomed.append(std::move(pair.second));
           it.remove();
+          continue;
+        }
+      }
+
+      totalBytes += pair.second->memoryBytes();
+    }
+  }
+
+  if (m_settings.memoryLimit != 0 && totalBytes > m_settings.memoryLimit) {
+    // Evict past the ceiling, not exactly to it: stopping on the line means
+    // the very next sweep is over again and pays for this pass every 5s
+    // forever. A working set that genuinely exceeds the ceiling then sorts
+    // once every several sweeps instead of continuously.
+    uint64_t target = m_settings.memoryLimit - m_settings.memoryLimit / 8;
+
+    // Entries the ceiling is allowed to drop, oldest-used first. A persisting
+    // entry is still referenced elsewhere, so dropping it frees the map slot
+    // and nothing else -- not worth listing.
+    List<pair<double, AssetId>> evictable;
+    for (auto const& pair : m_assetsCache) {
+      if (pair.second && !pair.second->shouldPersist() && !m_queue.contains(pair.first))
+        evictable.append({pair.second->time, pair.first});
+    }
+
+    sort(evictable, [](auto const& a, auto const& b) { return a.first < b.first; });
+    for (auto const& entry : evictable) {
+      if (totalBytes <= target)
+        break;
+      if (auto data = m_assetsCache.value(entry.second)) {
+        totalBytes -= min<uint64_t>(totalBytes, data->memoryBytes());
+        m_assetsCache.remove(entry.second);
+        doomed.append(std::move(data));
       }
     }
   }
+
+  memoryAccountSet(MemoryCategory::AssetCache, totalBytes);
 }
 
 bool Assets::AssetId::operator==(AssetId const& assetId) const {
@@ -824,6 +884,40 @@ bool Assets::FontData::shouldPersist() const {
 
 bool Assets::BytesData::shouldPersist() const {
   return forcePersist || !bytes.unique();
+}
+
+// Sizes below are the resident payload only; the map key, shared_ptr control
+// block and per-entry overhead are ignored because they are noise next to a
+// decompressed sprite sheet, which is what the ceiling exists to bound.
+size_t Assets::JsonData::memoryBytes() const {
+  // Walking a Json tree to size it exactly would cost more than the ceiling
+  // saves, and json assets are a small slice of a loaded game next to images.
+  // A flat estimate keeps them visible in the accounting without the walk.
+  return json.isNull() ? 0 : 512;
+}
+
+size_t Assets::ImageData::memoryBytes() const {
+  // Aliases point at another cache entry's image; counting them would
+  // double-count the same pixels.
+  if (alias || !image)
+    return 0;
+  return (size_t)image->width() * image->height() * image->bytesPerPixel();
+}
+
+size_t Assets::AudioData::memoryBytes() const {
+  if (!audio)
+    return 0;
+  // 16-bit samples; a still-compressed Audio holds the ogg bytes instead, so
+  // this over-reports those, which is the safe direction for a ceiling.
+  return (size_t)audio->totalSamples() * audio->channels() * 2;
+}
+
+size_t Assets::FontData::memoryBytes() const {
+  return font ? font->bufferBytes() : 0;
+}
+
+size_t Assets::BytesData::memoryBytes() const {
+  return bytes ? bytes->size() : 0;
 }
 
 FramesSpecification Assets::parseFramesSpecification(Json const& frameConfig, String path) {

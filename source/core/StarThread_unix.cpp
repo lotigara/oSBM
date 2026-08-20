@@ -142,10 +142,11 @@ struct ThreadImpl {
     }
     ptr->stopped = true;
 #if defined(STAR_SYSTEM_FAMILY_MOBILE) && defined(STAR_USE_RPMALLOC)
-    // Without the libc-override preload hooks (not installed on Switch),
-    // nothing releases this thread's rpmalloc heap on exit; do it here so
-    // short-lived threads (per-world server threads etc.) don't leak their
-    // span caches.
+    // Unmap this thread's empty spans, then orphan the heap. finalize(1)
+    // dumps any leftover cache into the global pool (usually none, after the
+    // unmap). finalize(0) was tried and crashed during application startup:
+    // orphaned heaps still holding cached spans got reused in a bad state.
+    rpmalloc_release_thread_caches();
     rpmalloc_thread_finalize(1);
 #endif
     return nullptr;

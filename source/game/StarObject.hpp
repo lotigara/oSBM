@@ -224,7 +224,9 @@ private:
 
   ObjectConfigConstPtr m_config;
   Maybe<List<ObjectOrientationPtr>> m_orientations;
-  NetElementHashMap<String, Json> m_parameters;
+  // JsonObject rather than a separate HashMap<String,Json>: object parameters
+  // are a Json object and are converted to and from one at every use.
+  NetElementMapWrapper<JsonObject> m_parameters;
 
   NetElementData<Maybe<String>> m_uniqueIdNetState;
 

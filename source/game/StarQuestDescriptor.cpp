@@ -293,10 +293,15 @@ String questParamText(QuestParam const& parameter) {
   }
 }
 
-template <typename Fun,
-    typename ArgType = typename FunctionTraits<Fun>::template Arg<0>,
+// Templated on the source map rather than fixed to StringMap: Json objects are
+// a sorted map now, so the inputs here are no longer all the same container.
+template <typename MapType, typename Fun,
     typename RetType = typename FunctionTraits<Fun>::Return>
-StringMap<RetType> transformedMapValues(StringMap<ArgType> const& map, Fun fun) {
+StringMap<RetType> transformedMapValues(MapType const& map, Fun fun) {
+  // Value type comes from the map, not from the function's argument type --
+  // the latter carries a const reference qualifier and will not match the
+  // pair the transform actually yields.
+  typedef typename MapType::mapped_type ArgType;
   return StringMap<RetType>::from(map.pairs().transformed(
       [fun](pair<String, ArgType> entry) { return make_pair(entry.first, fun(entry.second)); }));
 }
@@ -306,6 +311,8 @@ StringMap<String> questParamTags(StringMap<QuestParam> const& parameters) {
 }
 
 StringMap<QuestParam> questParamsFromJson(Json const& json) {
+  // Json objects are a sorted map now, so transform into the hash map this
+  // returns rather than letting the result type follow the input.
   return transformedMapValues(json.toObject(), &QuestParam::fromJson);
 }
 
@@ -314,11 +321,11 @@ StringMap<QuestParam> questParamsDiskLoad(Json const& json) {
 }
 
 Json questParamsToJson(StringMap<QuestParam> const& parameters) {
-  return transformedMapValues(parameters, [](QuestParam const& quest) { return quest.toJson(); });
+  return JsonObject::from(transformedMapValues(parameters, [](QuestParam const& quest) { return quest.toJson(); }));
 }
 
 Json questParamsDiskStore(StringMap<QuestParam> const& parameters) {
-  return transformedMapValues(parameters, [](QuestParam const& quest) { return quest.diskStore(); });
+  return JsonObject::from(transformedMapValues(parameters, [](QuestParam const& quest) { return quest.diskStore(); }));
 }
 
 DataStream& operator>>(DataStream& ds, QuestItem& item) {

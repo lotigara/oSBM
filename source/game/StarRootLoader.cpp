@@ -13,6 +13,11 @@ Json const BaseAssetsSettings = Json::parseJson(R"JSON(
 
       "workerPoolSize" : 2,
 
+      // Soft ceiling in MB for the asset cache; 0 leaves eviction purely
+      // TTL-based, which is the historical (and desktop) behavior. Mobile
+      // builds override this from the launcher's memory settings.
+      "memoryLimitMB" : 0,
+
       "pathIgnore" : [
         "/\\.",
         "/~",
@@ -174,6 +179,7 @@ Root::Settings RootLoader::rootSettingsForOptions(Options const& options) const 
     rootSettings.assetsSettings.assetTimeToLive = assetsSettings.getInt("assetTimeToLive");
     rootSettings.assetsSettings.audioDecompressLimit = assetsSettings.getFloat("audioDecompressLimit");
     rootSettings.assetsSettings.workerPoolSize = assetsSettings.getUInt("workerPoolSize");
+    rootSettings.assetsSettings.memoryLimit = (uint64_t)assetsSettings.getUInt("memoryLimitMB", 0) * 1024 * 1024;
     rootSettings.assetsSettings.missingImage = assetsSettings.optString("missingImage");
     rootSettings.assetsSettings.missingAudio = assetsSettings.optString("missingAudio");
     rootSettings.assetsSettings.pathIgnore = jsonToStringList(assetsSettings.get("pathIgnore"));

@@ -10,6 +10,17 @@
 
 namespace Star {
 
+namespace {
+  // Entries are small (a size, a rect, or a spaces list), so the ceiling is
+  // generous enough that a normal working set never touches it. Mobile runs in
+  // a fixed pool where the tail is what kills the process, so it keeps less.
+#ifdef STAR_SYSTEM_FAMILY_MOBILE
+  size_t const MaxCacheEntries = 16384;
+#else
+  size_t const MaxCacheEntries = 131072;
+#endif
+}
+
 ImageMetadataDatabase::ImageMetadataDatabase() {
   MutexLocker locker(m_mutex);
   int timeSmear = 2000;
@@ -20,6 +31,20 @@ ImageMetadataDatabase::ImageMetadataDatabase() {
   m_sizeCache.setTimeToLive(timeToLive);
   m_spacesCache.setTimeToLive(timeToLive);
   m_regionCache.setTimeToLive(timeToLive);
+
+  // These are keyed by AssetPath *including directives*, and gameplay mints
+  // unbounded distinct directive strings (damage flashes, colour swaps, health
+  // fades). A time-to-live alone does not bound them, because every access
+  // refreshes it -- anything still on screen never expires. Measured on
+  // hardware after several warps: ~500,000 live entries, 12MB in the index
+  // alone, still climbing.
+  //
+  // An explicit ceiling turns this into an LRU: the working set stays cached,
+  // the tail is evicted, and the cost of a miss is only recomputing metadata
+  // for one image.
+  m_sizeCache.setMaxSize(MaxCacheEntries);
+  m_spacesCache.setMaxSize(MaxCacheEntries);
+  m_regionCache.setMaxSize(MaxCacheEntries);
 }
 
 Vec2U ImageMetadataDatabase::imageSize(AssetPath const& path) const {

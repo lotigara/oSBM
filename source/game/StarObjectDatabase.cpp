@@ -317,6 +317,14 @@ List<ObjectOrientationPtr> ObjectDatabase::parseOrientations(String const& path,
 }
 
 ObjectDatabase::ObjectDatabase() : m_rebuilder(make_shared<Rebuilder>("object")) {
+  // Deliberately NOT size-bounded. Every placed Object holds a shared_ptr to
+  // its type's config, so evicting one that is still in use does not free it --
+  // it makes the next object of that type build a SECOND copy, and the two
+  // never merge. Measured on hardware with a 1024 entry bound: 231,744 live
+  // StringMap<Color> instances (186MB) where there should have been one per
+  // object TYPE. The key space here is the set of object types, which is
+  // finite and modest even under heavy mods, so the TTL alone is the right
+  // control.
   auto assets = Root::singleton().assets();
 
   auto& files = assets->scanExtension("object");
@@ -335,10 +343,19 @@ ObjectDatabase::ObjectDatabase() : m_rebuilder(make_shared<Rebuilder>("object"))
 }
 
 void ObjectDatabase::cleanup() {
-  MutexLocker locker(m_cacheMutex);
-  m_configCache.cleanup([](String const&, ObjectConfigPtr const& config) {
-      return !config.unique();
-    });
+  // Destroyed after the lock is dropped, for the same reason as
+  // ItemDatabase::cleanup: an ObjectConfig owns a parsed Json tree, and freeing
+  // a sweep's worth of them under m_cacheMutex stalls every object lookup.
+  List<ObjectConfigPtr> doomed;
+  {
+    MutexLocker locker(m_cacheMutex);
+    m_configCache.cleanup([&doomed](String const&, ObjectConfigPtr const& config) {
+        if (!config.unique())
+          return true;
+        doomed.append(config);
+        return false;
+      });
+  }
 }
 
 StringList ObjectDatabase::allObjects() const {

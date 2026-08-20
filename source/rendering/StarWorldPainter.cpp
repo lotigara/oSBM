@@ -1,3 +1,4 @@
+#include "StarMemoryUsage.hpp"
 #include "StarWorldPainter.hpp"
 #include "StarAnimation.hpp"
 #include "StarRoot.hpp"
@@ -340,10 +341,23 @@ void WorldPainter::render(WorldRenderData& renderData, function<bool()> lightWai
   wpLap(s_wpWorld);
 #endif
   static int64_t const textureTimeout = m_assets->json("/rendering.config:textureTimeout").toInt();
-  m_textPainter->cleanup(textureTimeout);
-  m_drawablePainter->cleanup(textureTimeout);
-  m_environmentPainter->cleanup(textureTimeout);
-  m_tilePainter->cleanup();
+
+  // Textures are the largest dynamic consumer on a real handheld, where the
+  // GL driver takes its GPU memory from the same pool as everything else, and
+  // the vanilla 30s timeout keeps everything seen in the last half minute
+  // resident. Under real pressure that is the difference between a reload
+  // hitch and an allocation failure, so shorten the window as the process
+  // approaches its ceiling. memoryUsageCached() rate-limits the OS query, and
+  // the fraction is 0 on platforms that expose no budget -- so this is inert
+  // unless the platform can actually say how close to the wall we are.
+  int64_t effectiveTimeout = textureTimeout;
+  float memoryFraction = memoryUsageCached().fraction();
+  if (memoryFraction >= 0.80f)
+    effectiveTimeout = textureTimeout / 8;
+  else if (memoryFraction >= 0.70f)
+    effectiveTimeout = textureTimeout / 3;
+
+  cleanup(effectiveTimeout);
 #ifdef STAR_SYSTEM_SWITCH
   wpLap(s_wpCleanup);
   if (++s_wpFrames >= 150) {
@@ -354,6 +368,25 @@ void WorldPainter::render(WorldRenderData& renderData, function<bool()> lightWai
     s_wpSetup = s_wpEnv = s_wpLight = s_wpWorld = s_wpCleanup = 0;
   }
 #endif
+}
+
+void WorldPainter::cleanup(int64_t textureTimeout) {
+  if (textureTimeout <= 0) {
+    m_bgValidSize = Vec2U();
+    m_bgFrameCounter = 0;
+  }
+  if (m_textPainter)
+    m_textPainter->cleanup(textureTimeout);
+  if (m_drawablePainter)
+    m_drawablePainter->cleanup(textureTimeout);
+  if (m_environmentPainter)
+    m_environmentPainter->cleanup(textureTimeout);
+  if (m_tilePainter) {
+    if (textureTimeout <= 0)
+      m_tilePainter->flush();
+    else
+      m_tilePainter->cleanup();
+  }
 }
 
 void WorldPainter::adjustLighting(WorldRenderData& renderData) {

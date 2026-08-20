@@ -115,6 +115,14 @@ void TilePainter::cleanup() {
   m_liquidChunkCache.cleanup();
 }
 
+void TilePainter::flush() {
+  m_pendingTerrainChunks.clear();
+  m_pendingLiquidChunks.clear();
+  m_textureCache.clear();
+  m_terrainChunkCache.clear();
+  m_liquidChunkCache.clear();
+}
+
 size_t TilePainter::TextureKeyHash::operator()(TextureKey const& key) const {
   if (key.is<MaterialPieceTextureKey>())
     return hashOf(key.typeIndex(), key.get<MaterialPieceTextureKey>());

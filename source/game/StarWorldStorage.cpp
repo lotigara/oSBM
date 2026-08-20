@@ -5,6 +5,7 @@
 #include "StarDataStreamExtra.hpp"
 #include "StarIterator.hpp"
 #include "StarLogging.hpp"
+#include "StarMemoryUsage.hpp"
 #include "StarTime.hpp"
 #include "StarRoot.hpp"
 #include "StarEntityMap.hpp"
@@ -14,6 +15,14 @@
 #include "StarLiquidsDatabase.hpp"
 
 namespace Star {
+
+namespace {
+  // Ceiling on database writes buffered in memory before a sync is forced.
+  // Small enough to keep the buffer off the memory budget, large enough that a
+  // normal sector flush still batches into one commit.
+  size_t const MaxUncommittedWriteBytes = 32 * 1024 * 1024;
+}
+
 
 WorldChunks WorldStorage::getWorldChunksUpdate(WorldChunks const& oldChunks, WorldChunks const& newChunks) {
   WorldChunks update;
@@ -94,10 +103,50 @@ WorldStorage::WorldStorage(WorldChunks const& chunks, WorldGeneratorFacadePtr co
 }
 
 WorldStorage::~WorldStorage() {
-  if (m_db.isOpen()) {
-    unloadAll(true);
-    m_db.close();
+  // unloadAll() throws on any storage error, and a destructor is implicitly
+  // noexcept: letting that escape calls std::terminate and kills the process
+  // with no usable diagnostic. Observed on Switch, where memory pressure makes
+  // a failing unload much more likely than on desktop.
+  //
+  // There is nothing to recover here -- the object is going away regardless --
+  // so log what happened and make sure the database is closed either way.
+  try {
+    if (m_db.isOpen()) {
+      unloadAll(true);
+      m_db.close();
+    }
+  } catch (std::exception const& e) {
+    Logger::error("WorldStorage: error unloading during destruction, world data may be incomplete: {}",
+        outputException(e, false));
+    try {
+      if (m_db.isOpen())
+        m_db.close();
+    } catch (std::exception const&) {
+      // Closing a database that is already failing is best-effort.
+    }
   }
+}
+
+bool WorldStorage::keepDatabaseOpenAfterError(std::exception const& e) const {
+  // Closing the database after an error is the right call for a DATA problem:
+  // it stops us writing more on top of something inconsistent. It is the wrong
+  // call when the operation merely ran out of memory -- the stored data is
+  // fine, and closing turns a transient failure into a permanently unusable
+  // world, because every later call throws "called when not open" and warps to
+  // that world silently bounce the player back.
+  //
+  // This is why the symptom is mobile-only: on desktop these operations do not
+  // fail, so the fragile path never runs. On Switch the process routinely sits
+  // above 90% of a fixed pool and any allocation can fail.
+  if (dynamic_cast<std::bad_alloc const*>(&e))
+    return true;
+
+  // Star exceptions flatten their cause into a string, so a bad_alloc wrapped
+  // by an inner layer is not visible above. Fall back to asking whether the
+  // process is out of memory right now, which is the condition that actually
+  // matters and does not depend on how the exception was wrapped.
+  auto usage = memoryUsage();
+  return usage.budget != 0 && usage.fraction() >= 0.90f;
 }
 
 VersionedJson WorldStorage::worldMetadata() {
@@ -157,7 +206,8 @@ void WorldStorage::loadSector(Sector sector) {
     setSectorTimeToLive(sector, randomizedSectorTTL());
   } catch (std::exception const& e) {
     m_db.rollback();
-    m_db.close();
+    if (!keepDatabaseOpenAfterError(e))
+      m_db.close();
     throw WorldStorageException(strf("Failed to load sector {}", sector), e);
   }
 }
@@ -168,7 +218,8 @@ void WorldStorage::activateSector(Sector sector) {
     setSectorTimeToLive(sector, randomizedSectorTTL());
   } catch (std::exception const& e) {
     m_db.rollback();
-    m_db.close();
+    if (!keepDatabaseOpenAfterError(e))
+      m_db.close();
     throw WorldStorageException(strf("Failed to load sector {}", sector), e);
   }
 }
@@ -198,7 +249,8 @@ void WorldStorage::triggerTerraformSector(Sector sector) {
     }
   } catch (std::exception const& e) {
     m_db.rollback();
-    m_db.close();
+    if (!keepDatabaseOpenAfterError(e))
+      m_db.close();
     throw WorldStorageException(strf("Failed to terraform sector {}", sector), e);
   }
 }
@@ -278,13 +330,24 @@ void WorldStorage::generateQueue(Maybe<size_t> sectorGenerationLevelLimit, funct
     }
   } catch (std::exception const& e) {
     m_db.rollback();
-    m_db.close();
+    if (!keepDatabaseOpenAfterError(e))
+      m_db.close();
     throw WorldStorageException("WorldStorage generation failed while generating from queue", e);
   }
 }
 
 void WorldStorage::tick(float dt, String const* worldId) {
   try {
+    // Every block the database touches is buffered whole until the next
+    // commit, so on a busy world the pending-write map grows without any bound
+    // between syncs. Measured on hardware as the single largest live
+    // allocation site: 358MB across 325,479 buffers, allocated in
+    // DataStreamBuffer and parked in BTreeDatabase::m_uncommittedWrites.
+    //
+    // Committing early is safe because it is exactly what the periodic sync
+    // already does -- a consistent point, not a partial transaction.
+    if (m_db.isOpen() && m_db.uncommittedBytes() >= MaxUncommittedWriteBytes)
+      sync();
     // Tick down generation queue entries, and erase any that are expired.
     eraseWhere(m_generationQueue, [dt](auto& p) {
         p.second -= dt;
@@ -366,7 +429,8 @@ void WorldStorage::tick(float dt, String const* worldId) {
     }
   } catch (std::exception const& e) {
     m_db.rollback();
-    m_db.close();
+    if (!keepDatabaseOpenAfterError(e))
+      m_db.close();
     throw WorldStorageException("WorldStorage exception during tick", e);
   }
 }
@@ -395,8 +459,16 @@ void WorldStorage::unloadAll(bool force) {
       unloadSectorToLevel(sector, SectorLoadLevel::None, force);
 
   } catch (std::exception const& e) {
+    // Log before closing: this close is what makes every later operation on
+    // this world fail with the far less informative "called when not open",
+    // and on hardware that secondary error was all that reached the log. The
+    // memory state matters too -- an unload that fails under pressure is a
+    // different problem from one that fails on corrupt data.
+    Logger::error("WorldStorage: unload failed ({}), keepOpen={}. Cause: {}",
+        memoryUsageSummary(), keepDatabaseOpenAfterError(e), outputException(e, false));
     m_db.rollback();
-    m_db.close();
+    if (!keepDatabaseOpenAfterError(e))
+      m_db.close();
     throw WorldStorageException("WorldStorage exception during unload", e);
   }
 }
@@ -408,7 +480,8 @@ void WorldStorage::sync() {
     m_db.commit();
   } catch (std::exception const& e) {
     m_db.rollback();
-    m_db.close();
+    if (!keepDatabaseOpenAfterError(e))
+      m_db.close();
     throw WorldStorageException("WorldStorage exception during sync", e);
   }
 }
@@ -427,7 +500,8 @@ WorldChunks WorldStorage::readChunks() {
 
   } catch (std::exception const& e) {
     m_db.rollback();
-    m_db.close();
+    if (!keepDatabaseOpenAfterError(e))
+      m_db.close();
     throw WorldStorageException("WorldStorage exception during readChunks", e);
   }
 }

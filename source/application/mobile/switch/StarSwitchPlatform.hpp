@@ -42,6 +42,12 @@ void switchApplyClockBoost();
 // Restores the pre-boost clock rates (called when returning to the launcher).
 void switchRestoreClocks();
 
+// Ask hbloader to chainload this NRO on the next return to the loader.
+void switchPlatformRequestRelaunch();
+
+// Chainload, then return to hbloader. Does not return.
+void switchPlatformRelaunchAndExit();
+
 // Runs one BLOCKING software-keyboard session (standard swkbd applet with its
 // own text-preview field), pre-filled with initialText. Returns true with the
 // decided string in outText, false if the user canceled. The game's text

@@ -1,6 +1,7 @@
 #include "StarSwitchPlatform.hpp"
 
 #include "StarFile.hpp"
+#include "StarDiagnostics.hpp"
 #include "StarLogging.hpp"
 
 #ifdef STAR_SYSTEM_SWITCH
@@ -10,7 +11,11 @@
 // the faulting PC/LR as module-relative offsets before libnx's fatal path
 // runs -- Ryujinx's own fatal report often carries a zeroed context, which
 // makes crashes on worker threads undiagnosable without this.
+#include <cstdio>
+#include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 extern "C" char __start__; // module base (libnx runtime symbol)
@@ -88,9 +93,164 @@ static void starSwitchCrashLog(char const* msg, size_t len) {
   close(fd);
 }
 
+// hbloader sets argv[0] to the launched NRO. Prefer /switch/oSBM.nro when it
+// exists so the on-device path does not embed VERSION. OSBM_SWITCH_NRO is the
+// versioned filename CMake also uses for nx_create_nro.
+#ifndef OSBM_SWITCH_NRO
+#define OSBM_SWITCH_NRO "/switch/oSBM.nro"
+#endif
+static char g_argvNro[0x300];
+static char g_bestNro[0x300];
+static char g_selfNro[0x300];
+extern "C" int __system_argc;
+extern "C" char** __system_argv;
+
+// oSBM.nro is generation 0; oSBM.<N>.nro is generation N. Anything else
+// (oSBM.next.nro, the CMake oSBM-<VERSION>-switch.nro name) is not a
+// generation and is ignored for chainload.
+static int starSwitchNroGeneration(char const* name) {
+  if (!name)
+    return -1;
+  if (strcmp(name, "oSBM.nro") == 0)
+    return 0;
+  unsigned gen = 0;
+  if (sscanf(name, "oSBM.%u.nro", &gen) != 1)
+    return -1;
+  char expect[32];
+  snprintf(expect, sizeof(expect), "oSBM.%u.nro", gen);
+  return strcmp(name, expect) == 0 ? (int)gen : -1;
+}
+
+static char const* starSwitchRelaunchPath() {
+  int best = -1;
+  g_bestNro[0] = 0;
+  if (DIR* dir = opendir("/switch")) {
+    while (dirent* ent = readdir(dir)) {
+      int gen = starSwitchNroGeneration(ent->d_name);
+      if (gen > best) {
+        best = gen;
+        snprintf(g_bestNro, sizeof(g_bestNro), "/switch/%s", ent->d_name);
+      }
+    }
+    closedir(dir);
+  }
+  if (g_bestNro[0])
+    return g_bestNro;
+  if (!g_argvNro[0] && __system_argc > 0 && __system_argv && __system_argv[0] && __system_argv[0][0])
+    snprintf(g_argvNro, sizeof(g_argvNro), "%s", __system_argv[0]);
+  if (g_argvNro[0])
+    return g_argvNro;
+  return OSBM_SWITCH_NRO;
+}
+
+// Drop every other oSBM*.nro so hbmenu (which shows NACP name, not filename)
+// only lists the build that actually booted. Unlink of the running file fails
+// harmlessly.
+static void starSwitchReapOldNros() {
+  char const* self = "";
+  if (__system_argc > 0 && __system_argv && __system_argv[0])
+    self = __system_argv[0];
+  if (DIR* dir = opendir("/switch")) {
+    while (dirent* ent = readdir(dir)) {
+      size_t n = strlen(ent->d_name);
+      if (n < 8 || strncmp(ent->d_name, "oSBM", 4) != 0 || strcmp(ent->d_name + n - 4, ".nro") != 0)
+        continue;
+      char path[0x300];
+      snprintf(path, sizeof(path), "/switch/%s", ent->d_name);
+      if (self[0] && strcmp(path, self) == 0)
+        continue;
+      unlink(path);
+    }
+    closedir(dir);
+  }
+  unlink("/switch/oSBM/reload.flag");
+}
+
+static bool starSwitchAutorestartEnabled() {
+  int fd = open("/switch/oSBM/autorestart.flag", O_RDONLY);
+  if (fd < 0)
+    return false;
+  close(fd);
+  return true;
+}
+
+// libnx's exception.s always `svcBreak`s if __libnx_exception_handler
+// returns. That is the Atmosphere fatal overlay. svcExitProcess is also
+// wrong here: it kills hbloader (the Application), and AM then shows
+// "The software was closed because an error occurred" and allows auto-sleep.
+// The Homebrew ABI exit is a jump to the loader LR via __nx_exit, which
+// keeps the Application process alive. If that pointer is missing, park
+// with auto-sleep held off -- HOME still works, the overlay does not.
+extern "C" void NX_NORETURN __nx_exit(int rc, LoaderReturnFn retaddr);
+static volatile int s_starSwitchAborting = 0;
+static volatile int s_starSwitchNextLoadSet = 0;
+
+static void starSwitchSetNextLoad(char const* path) {
+  if (!path || !path[0] || !envHasNextLoad())
+    return;
+  char full[0x300];
+  if (strncmp(path, "sdmc:", 5) != 0) {
+    snprintf(full, sizeof(full), "sdmc:%s", path);
+    path = full;
+  }
+  char args[0x320];
+  snprintf(args, sizeof(args), "\"%s\"", path);
+  envSetNextLoad(path, args);
+  s_starSwitchNextLoadSet = 1;
+  char buf[160];
+  int len = snprintf(buf, sizeof(buf), "relaunch: loader %s", path);
+  if (len > 0) {
+    svcOutputDebugString(buf, (size_t)len);
+    starSwitchCrashLog(buf, (size_t)len);
+  }
+}
+
+void Star::switchPlatformRequestRelaunch() {
+  starSwitchSetNextLoad(starSwitchRelaunchPath());
+}
+
+static void starSwitchDisableSleep() {
+  appletSetAutoSleepDisabled(true);
+  appletSetMediaPlaybackState(true);
+}
+
+static void NX_NORETURN starSwitchParkNoFatal() {
+  for (;;) {
+    starSwitchDisableSleep();
+    svcSleepThread(500000000ull);
+  }
+}
+
+static void NX_NORETURN starSwitchReturnToLoader() {
+  starSwitchDisableSleep();
+  if (s_starSwitchAborting)
+    starSwitchParkNoFatal();
+  s_starSwitchAborting = 1;
+
+  // Do not overwrite a next-load path already set (reload.flag picked the
+  // newest generation). A crash with no path yet still prefers the newest
+  // numbered NRO so a binary pushed while this one was running is used.
+  if (!s_starSwitchNextLoadSet && starSwitchAutorestartEnabled())
+    starSwitchSetNextLoad(starSwitchRelaunchPath());
+
+  LoaderReturnFn ret = envGetExitFuncPtr();
+  if (ret)
+    __nx_exit(0, ret);
+  starSwitchParkNoFatal();
+}
+
+void Star::switchPlatformRelaunchAndExit() {
+  switchPlatformRequestRelaunch();
+  starSwitchReturnToLoader();
+}
+
 extern "C" {
 alignas(16) unsigned char __nx_exception_stack[0x8000];
 u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
+// libnx skips our handler when a debugger (Atmosphere crash reporter / dmnt)
+// is attached, then svcReturnFromException(0xf801) which is the other path
+// onto the fatal overlay. Force the userspace handler always.
+u32 __nx_exception_ignoredebug = 1;
 // Override libnx's fatalThrow (strong symbol beats the library's) purely to
 // log WHO throws it: intermittent libnx-module fatals (e.g. 345-8
 // NotInitialized) otherwise present as a spontaneous clean exit with a
@@ -105,7 +265,7 @@ extern "C" void __stack_chk_fail(void) {
   const char* m = "ABORT: __stack_chk_fail (stack buffer overflow detected)";
   svcOutputDebugString(m, strlen(m));
   starSwitchCrashLog(m, strlen(m));
-  for (;;) svcSleepThread(1000000000ull);
+  starSwitchReturnToLoader();
 }
 static void starSwitchTerminateHandler() {
   const char* m = "ABORT: std::terminate";
@@ -126,7 +286,7 @@ static void starSwitchTerminateHandler() {
       starSwitchCrashLog(m2, strlen(m2));
     }
   }
-  for (;;) svcSleepThread(1000000000ull);
+  starSwitchReturnToLoader();
 }
 struct StarSwitchTerminateInstaller {
   StarSwitchTerminateInstaller() { std::set_terminate(starSwitchTerminateHandler); }
@@ -145,8 +305,36 @@ void NX_NORETURN __wrap_fatalThrow(Result err) {
     svcOutputDebugString(buf, (size_t)len);
     starSwitchCrashLog(buf, (size_t)len);
   }
-  __real_fatalThrow(err);
-  for (;;) svcSleepThread(1000000000ull);
+  starSwitchReturnToLoader();
+}
+
+extern "C" Result __real_svcBreak(u32 breakReason, uintptr_t address, uintptr_t size);
+extern "C" Result __wrap_svcBreak(u32 breakReason, uintptr_t address, uintptr_t size) {
+  (void)breakReason;
+  (void)address;
+  (void)size;
+  // libnx exception.s hits this if the handler returns. Never honor it.
+  const char* m = "ABORT: svcBreak intercepted";
+  svcOutputDebugString(m, strlen(m));
+  starSwitchCrashLog(m, strlen(m));
+  starSwitchReturnToLoader();
+}
+
+extern "C" void NX_NORETURN __real_svcReturnFromException(Result res);
+extern "C" void NX_NORETURN __wrap_svcReturnFromException(Result res) {
+  // exception.s abort path: svcReturnFromException(0xf801) then hang.
+  // Atmosphere treats that as an unhandled exception and shows the fatal
+  // overlay. Never hand a failed result back to the kernel.
+  if (res != 0) {
+    char buf[80];
+    int len = snprintf(buf, sizeof(buf), "ABORT: ReturnFromException 0x%x intercepted", res);
+    if (len > 0) {
+      svcOutputDebugString(buf, (size_t)len);
+      starSwitchCrashLog(buf, (size_t)len);
+    }
+    starSwitchReturnToLoader();
+  }
+  __real_svcReturnFromException(res);
 }
 
 // libnx's INTERNAL result assertions (e.g. in applet.o's message pump) abort
@@ -220,15 +408,16 @@ extern "C" void NX_NORETURN __wrap_exit(int code) {
   if (l > 0) svcOutputDebugString(b, (size_t)l);
   starSwitchLogBacktrace("EXITCALL");
   __real_exit(code);
-  for (;;) svcSleepThread(1000000000ull);
+  starSwitchReturnToLoader();
 }
 extern "C" void NX_NORETURN __real__exit(int code);
 extern "C" void NX_NORETURN __wrap__exit(int code) {
   char b[64]; int l = snprintf(b, sizeof(b), "EXITCALL: _exit(%d)", code);
   if (l > 0) svcOutputDebugString(b, (size_t)l);
   starSwitchLogBacktrace("_EXITCALL");
-  __real__exit(code);
-  for (;;) svcSleepThread(1000000000ull);
+  // _exit would svcExitProcess, which is the error-applet path. Return
+  // to hbloader instead, same as a clean NRO main() return.
+  starSwitchReturnToLoader();
 }
 extern "C" void __real_appletExit(void);
 extern "C" void __wrap_appletExit(void) {
@@ -270,6 +459,7 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx) {
     }
     fp = frame[0];
   }
+  starSwitchReturnToLoader();
 }
 }
 
@@ -291,6 +481,15 @@ namespace {
 
   std::atomic_flag g_initStarted = ATOMIC_FLAG_INIT;
   bool g_romfsMounted = false;
+  ::Thread g_sleepGuardThread;
+
+  void sleepGuardMain(void*) {
+    for (;;) {
+      appletSetAutoSleepDisabled(true);
+      appletSetMediaPlaybackState(true);
+      svcSleepThread(2000000000ull);
+    }
+  }
 
   void copyDirectoryRecursive(String const& source, String const& target) {
     if (!File::isDirectory(source))
@@ -312,6 +511,9 @@ namespace {
 void switchPlatformInit() {
   if (g_initStarted.test_and_set())
     return;
+
+  if (__system_argc > 0 && __system_argv && __system_argv[0] && __system_argv[0][0])
+    snprintf(g_selfNro, sizeof(g_selfNro), "%s", __system_argv[0]);
 
   {
     // Boot marker in the crash file so any handler entries that follow can be
@@ -374,7 +576,29 @@ void switchPlatformInit() {
   // existing directory and never reaches "/".
   mkdir("/switch", 0777);
   mkdir("/switch/oSBM", 0777);
+  starSwitchReapOldNros();
   switchDebugLog("switchPlatformInit: storage dirs ensured at /switch/oSBM");
+
+  {
+    int fd = open("/switch/oSBM/heartbeat.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+      char const* bootHb = "state=running\nbeat=0\nuptimeSeconds=0.0\nactivity=boot\nstep=init\n";
+      write(fd, bootHb, strlen(bootHb));
+      fsync(fd);
+      close(fd);
+    }
+  }
+
+  // Handheld/docked auto-sleep is idle-timeout based. With no controller
+  // input the console would sleep mid-load or mid-soak and drop the network.
+  // A dedicated thread re-asserts this: applet calls from a dying thread do
+  // not persist across the fatal overlay, and a stuck main thread cannot.
+  appletSetAutoSleepDisabled(true);
+  appletSetMediaPlaybackState(true);
+  if (R_SUCCEEDED(threadCreate(&g_sleepGuardThread, sleepGuardMain, nullptr, nullptr, 0x4000, 0x28, -2))) {
+    threadStart(&g_sleepGuardThread);
+    switchDebugLog("switchPlatformInit: auto-sleep guard thread started");
+  }
 
   // Give Star a real, writable temp directory. Without this, temporaryRootDirectory()
   // falls back to newlib's P_tmpdir ("/tmp"), which does not exist on the SD card;
@@ -505,6 +729,11 @@ namespace {
 }
 
 void switchInstallLogSink() {
+  // Enable the crash-survivable heartbeat as soon as logging exists. A crash
+  // otherwise leaves only a truncated log with no way to tell it apart from a
+  // clean exit -- see scripts/switch-testkit.sh, which reads this file.
+  diagnosticsSetHeartbeatPath("/switch/oSBM/heartbeat.txt");
+
   static LogSinkPtr sink = []() {
     auto s = make_shared<SwitchLogSink>();
     s->setLevel(LogLevel::Info);
@@ -573,6 +802,7 @@ void switchApplyClockBoost() {
 }
 
 void switchRestoreClocks() {
+  appletSetAutoSleepDisabled(false);
   if (!g_clockBoost.active)
     return;
   g_clockBoost.active = false;

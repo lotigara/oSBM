@@ -303,6 +303,7 @@ void BTreeDatabase::rollback() {
   m_availableBlocks.clear();
   m_indexCache.clear();
   m_uncommittedWrites.clear();
+  m_uncommittedWriteBytes = 0;
   m_uncommitted.clear();
 
   readRoot();
@@ -925,8 +926,10 @@ void BTreeDatabase::rawWriteBlock(BlockIndex blockIndex, size_t blockOffset, cha
 
   StreamOffset blockStart = HeaderSize + blockIndex * (StreamOffset)m_blockSize;
   auto buffer = m_uncommittedWrites.find(blockIndex);
-  if (buffer == m_uncommittedWrites.end())
+  if (buffer == m_uncommittedWrites.end()) {
     buffer = m_uncommittedWrites.emplace(blockIndex, m_device->readBytesAbsolute(blockStart, m_blockSize)).first;
+    m_uncommittedWriteBytes += buffer->second.size();
+  }
 
   buffer->second.writeFrom(block, blockOffset, size);
 }
@@ -1015,8 +1018,10 @@ auto BTreeDatabase::leafTailBlocks(BlockIndex leafPointer) -> List<BlockIndex> {
 void BTreeDatabase::freeBlock(BlockIndex b) {
   if (m_uncommitted.contains(b))
     m_uncommitted.remove(b);
-  if (m_uncommittedWrites.contains(b))
+  if (auto pending = m_uncommittedWrites.ptr(b)) {
+    m_uncommittedWriteBytes -= min(m_uncommittedWriteBytes, pending->size());
     m_uncommittedWrites.remove(b);
+  }
 
   m_availableBlocks.add(b);
 }
@@ -1139,12 +1144,17 @@ void BTreeDatabase::doCommit() {
   m_uncommitted.clear();
 }
 
+size_t BTreeDatabase::uncommittedBytes() const {
+  return m_uncommittedWriteBytes;
+}
+
 void BTreeDatabase::commitWrites() {
   for (auto& write : m_uncommittedWrites)
     m_device->writeFullAbsolute(HeaderSize + write.first * (StreamOffset)m_blockSize, write.second.ptr(), m_blockSize);
 
   m_device->sync();
   m_uncommittedWrites.clear();
+  m_uncommittedWriteBytes = 0;
 }
 
 bool BTreeDatabase::tryFlatten() {

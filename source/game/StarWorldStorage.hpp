@@ -184,6 +184,11 @@ public:
   void setFloatingDungeonWorld(bool floatingDungeonWorld);
 
 private:
+  // Decides whether a failed storage operation should also close the database.
+  // Closing is right for data errors and wrong for running out of memory --
+  // see the definition.
+  bool keepDatabaseOpenAfterError(std::exception const& e) const;
+
   enum class StoreType : uint8_t {
     Metadata = 0,
     TileSector = 1,

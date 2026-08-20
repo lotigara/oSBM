@@ -617,6 +617,10 @@ public:
   // Bytes in use by lua
   size_t memoryUsage() const;
 
+  // Bytes allocated by EVERY Lua state in the process. memoryUsage() above
+  // covers only this engine, and the game runs many engines at once.
+  static size_t totalMemoryUsage();
+
   // Enforce null-terminated string conversion as long as the returned enforcer object is in scope.
   LuaNullEnforcer nullTerminate();
   // Disables null-termination enforcement
@@ -642,6 +646,7 @@ private:
   static void countHook(lua_State* state, lua_Debug* ar);
 
   static void* allocate(void* userdata, void* ptr, size_t oldSize, size_t newSize);
+  static std::atomic<int64_t> s_totalAllocatedBytes;
 
   // Pops lua error from stack and throws LuaException
   void handleError(lua_State* state, int res);

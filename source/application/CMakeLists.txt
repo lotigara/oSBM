@@ -121,6 +121,12 @@ ENDIF ()
 
 ADD_LIBRARY (star_application OBJECT ${star_application_SOURCES} ${star_application_HEADERS})
 
+IF (STAR_SYSTEM_SWITCH)
+  # Same path CMake uses for nx_create_nro OUTPUT; keep in lockstep with VERSION.
+  TARGET_COMPILE_DEFINITIONS(star_application PRIVATE
+    "OSBM_SWITCH_NRO=\"/switch/oSBM-${OSBM_VERSION}-switch.nro\"")
+ENDIF ()
+
 IF (STAR_SYSTEM_IOS)
   TARGET_COMPILE_OPTIONS(star_application PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
 ENDIF ()

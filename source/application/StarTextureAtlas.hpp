@@ -74,6 +74,17 @@ protected:
   virtual void destroyAtlasTexture(AtlasTextureHandle const& atlasTexture) = 0;
   virtual void copyAtlasPixels(AtlasTextureHandle const& atlasTexture, Vec2U const& bottomLeft, Image const& image) = 0;
 
+  // Moves an already-resident block of pixels between two atlas textures
+  // entirely on the GPU. This is what lets the atlas set forget the CPU-side
+  // copy of every texture it holds: without it, compaction would need the
+  // source pixels back, which meant keeping a second full RGBA copy of every
+  // sprite in RAM for the whole life of the texture (roughly doubling texture
+  // memory on mobile). Returning false means the backend cannot do the copy,
+  // and compaction is then disabled for the rest of the run rather than
+  // falling back to a CPU copy that no longer exists.
+  virtual bool copyAtlasRegion(AtlasTextureHandle const& destAtlasTexture, Vec2U const& destBottomLeft,
+      AtlasTextureHandle const& sourceAtlasTexture, RectU const& sourceRegion) = 0;
+
 private:
   struct TextureAtlas {
     AtlasTextureHandle atlasTexture;
@@ -102,7 +113,9 @@ private:
 
     bool expired() const override;
 
-    Image textureImage;
+    // Size of the block of atlas pixels this entry owns, border included.
+    // Deliberately not the pixels themselves -- see copyAtlasRegion().
+    Vec2U storedSize;
     AtlasPlacement atlasPlacement;
     bool placementLocked = false;
     bool textureExpired = false;
@@ -110,12 +123,19 @@ private:
 
   void setAtlasRegionUsed(TextureAtlas* extureAtlas, RectU const& region, bool used) const;
 
-  Maybe<AtlasPlacement> addTextureToAtlas(TextureAtlas* atlas, Image const& image, bool borderPixels);
+  // Reserves room for a storedSize block in the given atlas and marks the
+  // cells used, without writing any pixels; the caller supplies those, either
+  // from an Image (a fresh add) or from another atlas (compaction).
+  Maybe<AtlasPlacement> reserveInAtlas(TextureAtlas* atlas, Vec2U const& storedSize, bool borderPixels);
   void sortAtlases();
 
   unsigned m_atlasCellSize;
   unsigned m_atlasNumCells;
   unsigned m_textureFitTries;
+  // Latched when copyAtlasRegion() first reports the backend cannot move
+  // pixels atlas-to-atlas. Compaction then stops for good: atlases just stay
+  // fragmented, which costs atlas slots but never corrupts a texture.
+  bool m_compactionUnsupported = false;
 
   List<shared_ptr<TextureAtlas>> m_atlases;
   HashSet<shared_ptr<TextureEntry>> m_textures;
@@ -166,12 +186,14 @@ auto TextureAtlasSet<AtlasTextureHandle>::addTexture(Image const& image, bool bo
   }
 
   auto tryAtlas = [&](TextureAtlas* atlas) -> TextureHandle {
-    auto placement = addTextureToAtlas(atlas, finalImage, borderPixels);
+    auto placement = reserveInAtlas(atlas, finalImage.size(), borderPixels);
     if (!placement)
       return nullptr;
 
+    copyAtlasPixels(atlas->atlasTexture, placement->occupiedCells.min() * m_atlasCellSize, finalImage);
+
     auto textureEntry = make_shared<TextureEntry>();
-    textureEntry->textureImage = std::move(finalImage);
+    textureEntry->storedSize = finalImage.size();
     textureEntry->atlasPlacement = *placement;
 
     m_textures.add(textureEntry);
@@ -207,12 +229,24 @@ auto TextureAtlasSet<AtlasTextureHandle>::addTexture(Image const& image, bool bo
 template <typename AtlasTextureHandle>
 void TextureAtlasSet<AtlasTextureHandle>::freeTexture(TextureHandle const& texture) {
   auto textureEntry = convert<TextureEntry>(texture);
+  TextureAtlas* atlas = textureEntry->atlasPlacement.atlas;
 
-  setAtlasRegionUsed(textureEntry->atlasPlacement.atlas, textureEntry->atlasPlacement.occupiedCells, false);
-  sortAtlases();
+  setAtlasRegionUsed(atlas, textureEntry->atlasPlacement.occupiedCells, false);
 
   textureEntry->textureExpired = true;
   m_textures.remove(textureEntry);
+
+  if (atlas->usedCellCount == 0) {
+    for (size_t i = 0; i < m_atlases.size(); ++i) {
+      if (m_atlases[i].get() == atlas) {
+        destroyAtlasTexture(m_atlases[i]->atlasTexture);
+        m_atlases.eraseAt(i);
+        return;
+      }
+    }
+  }
+
+  sortAtlases();
 }
 
 template <typename AtlasTextureHandle>
@@ -238,6 +272,9 @@ float TextureAtlasSet<AtlasTextureHandle>::averageFillLevel() const {
 
 template <typename AtlasTextureHandle>
 void TextureAtlasSet<AtlasTextureHandle>::compressionPass(size_t textureCount) {
+  if (m_compactionUnsupported)
+    return;
+
   while (m_atlases.size() > 1 && textureCount > 0) {
     // Find the least full atlas, If it is empty, remove it and start at the
     // next atlas.
@@ -270,13 +307,31 @@ void TextureAtlasSet<AtlasTextureHandle>::compressionPass(size_t textureCount) {
     // Try to add the texture to any atlas that isn't the last (most empty) one
     size_t startAtlas = m_atlases.size() - 1 - min<size_t>(m_atlases.size() - 1, m_textureFitTries);
     for (size_t i = startAtlas; i < m_atlases.size() - 1; ++i) {
-      if (auto placement = addTextureToAtlas(m_atlases[i].get(), smallestTexture->textureImage, smallestTexture->atlasPlacement.borderPixels)) {
-        setAtlasRegionUsed(smallestTexture->atlasPlacement.atlas, smallestTexture->atlasPlacement.occupiedCells, false);
-        smallestTexture->atlasPlacement = *placement;
-        smallestTexture = nullptr;
+      auto sourcePlacement = smallestTexture->atlasPlacement;
+      auto placement = reserveInAtlas(m_atlases[i].get(), smallestTexture->storedSize, sourcePlacement.borderPixels);
+      if (!placement)
+        continue;
+
+      // The whole stored block moves, border included, so the destination is
+      // byte-identical to the source and the placement's texture coordinates
+      // stay valid relative to the new cell origin.
+      RectU sourceRegion = RectU::withSize(
+          sourcePlacement.occupiedCells.min() * m_atlasCellSize, smallestTexture->storedSize);
+      if (!copyAtlasRegion(m_atlases[i]->atlasTexture, placement->occupiedCells.min() * m_atlasCellSize,
+              sourcePlacement.atlas->atlasTexture, sourceRegion)) {
+        // Give the reserved cells back and never try again -- the texture is
+        // still intact where it was.
+        setAtlasRegionUsed(m_atlases[i].get(), placement->occupiedCells, false);
+        m_compactionUnsupported = true;
         sortAtlases();
-        break;
+        return;
       }
+
+      setAtlasRegionUsed(sourcePlacement.atlas, sourcePlacement.occupiedCells, false);
+      smallestTexture->atlasPlacement = *placement;
+      smallestTexture = nullptr;
+      sortAtlases();
+      break;
     }
 
     // If we have not managed to move the smallest texture into any other
@@ -301,9 +356,9 @@ void TextureAtlasSet<AtlasTextureHandle>::setTextureFitTries(unsigned textureFit
 template <typename AtlasTextureHandle>
 Vec2U TextureAtlasSet<AtlasTextureHandle>::TextureEntry::imageSize() const {
   if (atlasPlacement.borderPixels)
-    return textureImage.size() - Vec2U(2, 2);
+    return storedSize - Vec2U(2, 2);
   else
-    return textureImage.size();
+    return storedSize;
 }
 
 template <typename AtlasTextureHandle>
@@ -352,13 +407,13 @@ void TextureAtlasSet<AtlasTextureHandle>::sortAtlases() {
 }
 
 template <typename AtlasTextureHandle>
-auto TextureAtlasSet<AtlasTextureHandle>::addTextureToAtlas(TextureAtlas* atlas, Image const& image, bool borderPixels) -> Maybe<AtlasPlacement> {
+auto TextureAtlasSet<AtlasTextureHandle>::reserveInAtlas(TextureAtlas* atlas, Vec2U const& storedSize, bool borderPixels) -> Maybe<AtlasPlacement> {
   bool found = false;
   // Minimum cell indexes where this texture fits in this atlas.
   unsigned fitCellX = 0;
   unsigned fitCellY = 0;
 
-  Vec2U imageSize = image.size();
+  Vec2U imageSize = storedSize;
 
   // Number of cells this image will take.
   size_t numCellsX = (imageSize[0] + m_atlasCellSize - 1) / m_atlasCellSize;
@@ -401,8 +456,6 @@ auto TextureAtlasSet<AtlasTextureHandle>::addTextureToAtlas(TextureAtlas* atlas,
     return {};
 
   setAtlasRegionUsed(atlas, RectU::withSize({fitCellX, fitCellY}, {(unsigned)numCellsX, (unsigned)numCellsY}), true);
-
-  copyAtlasPixels(atlas->atlasTexture, Vec2U(fitCellX * m_atlasCellSize, fitCellY * m_atlasCellSize), image);
 
   AtlasPlacement atlasPlacement;
   atlasPlacement.atlas = atlas;

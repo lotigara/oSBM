@@ -82,6 +82,10 @@ unsigned Font::height() const {
   return m_pixelSize;
 }
 
+size_t Font::bufferBytes() const {
+  return m_fontBuffer ? m_fontBuffer->size() : 0;
+}
+
 unsigned Font::width(String::Char c) {
   if (auto width = m_widthCache.maybe({c, m_pixelSize})) {
     return *width;

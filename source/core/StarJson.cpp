@@ -247,6 +247,15 @@ JsonArrayConstPtr Json::arrayPtr() const {
   return m_data.get<JsonArrayConstPtr>();
 }
 
+void const* Json::payloadPointer() const {
+  switch (type()) {
+    case Type::String: return m_data.get<StringConstPtr>().get();
+    case Type::Array:  return m_data.get<JsonArrayConstPtr>().get();
+    case Type::Object: return m_data.get<JsonObjectConstPtr>().get();
+    default: return nullptr;
+  }
+}
+
 JsonObjectConstPtr Json::objectPtr() const {
   if (type() != Type::Object)
     throw JsonException::format("Improper conversion to JsonObject from {}", typeName());

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include "StarWorld.hpp"
 #include "StarWorldClientState.hpp"
 #include "StarCollisionGenerator.hpp"
@@ -45,6 +47,10 @@ enum class WorldServerFidelity {
   High
 };
 extern EnumMap<WorldServerFidelity> const WorldServerFidelityNames;
+
+// Live WorldServer instances. Exposed so the memory report can show whether
+// unloading a world actually destroys it.
+std::atomic<int>& worldServerLiveCount();
 
 class WorldServer : public World {
 public:
@@ -388,6 +394,12 @@ private:
   // See WorldClient::m_nullCollisionScratch.
   mutable List<CollisionBlock> m_nullCollisionScratch;
   ServerTileGetter m_tileGetterFunction;
+  // This world's allocation heap. Everything the world allocates on its own
+  // thread comes from here, so when the world is destroyed its spans empty and
+  // the allocator can return them instead of leaving them half-occupied. Held
+  // as void* to keep rpmalloc's types out of the engine headers.
+  void* m_memoryHeap = nullptr;
+
   WorldStoragePtr m_worldStorage;
   WorldServerFidelity m_fidelity;
   Json m_fidelityConfig;

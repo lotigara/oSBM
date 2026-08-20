@@ -3,6 +3,8 @@
 #include "StarDataStream.hpp"
 #include "StarVariant.hpp"
 #include "StarString.hpp"
+#include "StarFlatSortedMap.hpp"
+#include "StarMap.hpp"
 #include "StarXXHash.hpp"
 
 namespace Star {
@@ -15,7 +17,10 @@ STAR_CLASS(Json);
 typedef List<Json> JsonArray;
 typedef shared_ptr<JsonArray const> JsonArrayConstPtr;
 
-typedef StringMap<Json> JsonObject;
+// A sorted flat map rather than a hash map: Json objects are small, immutable
+// once parsed, and there are millions of them, so the hash map's empty slots and
+// stored hashes dominated. See StarFlatSortedMap.hpp.
+typedef MapMixin<FlatSortedMap<String, Json>> JsonObject;
 typedef shared_ptr<JsonObject const> JsonObjectConstPtr;
 
 // Class for holding representation of JSON data.  Immutable and implicitly
@@ -100,6 +105,13 @@ public:
   StringConstPtr stringPtr() const;
   JsonArrayConstPtr arrayPtr() const;
   JsonObjectConstPtr objectPtr() const;
+
+  // Identity of the shared payload for String, Array and Object (null for the
+  // scalar types), without copying the shared_ptr. The accessors above return
+  // by value, so using them merely to compare two values costs a pair of
+  // atomic reference-count updates each time -- which measured as 16% of load
+  // time when comparing values element by element.
+  void const* payloadPointer() const;
 
   // As a convenience, make it easy to safely and quickly iterate over a
   // JsonArray or JsonObject contents by holding the container pointer.

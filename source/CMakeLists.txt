@@ -164,6 +164,9 @@ option(STAR_LUA_APICHECK "Use lua api checks" OFF)
 option(STAR_USE_JEMALLOC "Use jemalloc allocators" OFF)
 option(STAR_USE_MIMALLOC "Use mimalloc allocators" OFF)
 option(STAR_USE_RPMALLOC "Use rpmalloc allocators" OFF)
+# Diagnostic only: samples live allocations by caller so a leak can be
+# attributed. Adds a hash probe to every free, so never ship it.
+option(STAR_ALLOC_PROFILE "Sampled live-allocation profiler (leak hunting)" OFF)
 
 # Build the oSBM mobile-style app path (ImGui launcher + touch/gamepad
 # adapters + mobile platform services) on a desktop PC target. This flips
@@ -238,6 +241,15 @@ function(SET_FLAG flagValue)
   set(${flagValue} TRUE PARENT_SCOPE)
   add_definitions(-D${flagValue})
 endfunction()
+
+if(STAR_ALLOC_PROFILE)
+  set_flag(STAR_ALLOC_PROFILE)
+  # rpmalloc's own statistics: the only authoritative source for how much span
+  # it holds per size class, which is what separates live data from
+  # fragmentation. Adds atomics to the allocator hot path, so profiling only.
+  add_definitions(-DENABLE_STATISTICS=1)
+  message(STATUS "Allocation profiler: ON (diagnostic build)")
+endif()
 
 if(STAR_LITTLE_ENDIAN)
   set_flag(STAR_LITTLE_ENDIAN)
@@ -351,7 +363,13 @@ if(STAR_USE_JEMALLOC)
 elseif(STAR_USE_MIMALLOC)
   add_definitions(-DSTAR_USE_MIMALLOC)
 elseif(STAR_USE_RPMALLOC)
-  add_definitions(-DSTAR_USE_RPMALLOC -DENABLE_PRELOAD)
+  # ENABLE_STATISTICS is on for rpmalloc builds while the per-warp retention is
+  # being chased: it is what makes rpmalloc_occupancy_report able to say whether
+  # a world's memory is still live or is stranded in partly-used spans. Costs
+  # some atomics on the allocator path; remove once that question is settled.
+  # RPMALLOC_FIRST_CLASS_HEAPS gives each world its own heap so its spans empty
+  # when it is destroyed; see StarMemoryDomain.hpp.
+  add_definitions(-DSTAR_USE_RPMALLOC -DENABLE_PRELOAD -DENABLE_STATISTICS=1 -DRPMALLOC_FIRST_CLASS_HEAPS=1)
 endif()
 
 # Set C/C++ compiler flags based on build environment...

@@ -5,6 +5,7 @@
 #include "StarLogging.hpp"
 #include "StarAssets.hpp"
 #include "StarPlayer.hpp"
+#include "StarMemoryUsage.hpp"
 
 namespace Star {
 
@@ -24,6 +25,8 @@ WorldServerThread::~WorldServerThread() {
   join();
 
   RecursiveMutexLocker locker(m_mutex);
+  if (!m_worldServer)
+    return;
   for (auto clientId : m_worldServer->clientIds())
     removeClient(clientId);
 }
@@ -182,6 +185,8 @@ Maybe<pair<String, String>> WorldServerThread::pullNewPlanetType() {
 
 void WorldServerThread::executeAction(WorldServerAction action) {
   RecursiveMutexLocker locker(m_mutex);
+  if (!m_worldServer)
+    return;
   action(this, m_worldServer.get());
 }
 
@@ -198,7 +203,8 @@ void WorldServerThread::passMessages(List<Message>&& messages) {
 void WorldServerThread::unloadAll(bool force) {
   try {
     RecursiveMutexLocker locker(m_mutex);
-    m_worldServer->unloadAll(force);
+    if (m_worldServer)
+      m_worldServer->unloadAll(force);
   } catch (std::exception const& e) {
     String error = strf("{}", outputException(e, true));
     Logger::error("WorldServerThread exception caught: {}", error);
@@ -209,6 +215,8 @@ void WorldServerThread::unloadAll(bool force) {
 WorldChunks WorldServerThread::readChunks() {
   try {
     RecursiveMutexLocker locker(m_mutex);
+    if (!m_worldServer)
+      return take(m_finalChunks);
     return m_worldServer->readChunks();
   } catch (std::exception const& e) {
     String error = strf("{}", outputException(e, true));
@@ -216,6 +224,11 @@ WorldChunks WorldServerThread::readChunks() {
     markError(std::move(error));
     return {};
   }
+}
+
+WorldChunks WorldServerThread::takeFinalChunks() {
+  RecursiveMutexLocker locker(m_mutex);
+  return take(m_finalChunks);
 }
 
 void WorldServerThread::run() {
@@ -274,6 +287,29 @@ void WorldServerThread::run() {
     String error = strf("{}", outputException(e, true));
     Logger::error("WorldServerThread exception caught: {}", error);
     markError(std::move(error));
+  }
+
+  // Destroy the WorldServer on THIS thread, the one that allocated it.
+  // rpmalloc defers cross-thread frees onto the owning heap; once this
+  // thread exits that heap is orphaned and those deferred lists are never
+  // drained -- measured as ~800MB kept after each outpost visit.
+  RecursiveMutexLocker locker(m_mutex);
+  if (!m_worldServer)
+    return;
+  try {
+    Logger::info("WorldServerThread: destroying world {} on its own thread", m_worldId);
+    if (!m_errorOccurred && m_worldId.is<ClientShipWorldId>()) {
+      m_worldServer->unloadAll(true);
+      m_finalChunks = m_worldServer->readChunks();
+    }
+    m_worldServer.reset();
+    memoryReleaseThreadCaches();
+  } catch (std::exception const& e) {
+    String error = strf("{}", outputException(e, true));
+    Logger::error("WorldServerThread exception caught during teardown: {}", error);
+    markError(std::move(error));
+    m_worldServer.reset();
+    memoryReleaseThreadCaches();
   }
 }
 

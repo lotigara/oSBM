@@ -455,6 +455,15 @@ void EnvironmentPainter::renderParallaxLayers(
 }
 
 void EnvironmentPainter::cleanup(int64_t textureTimeout) {
+  if (textureTimeout <= 0) {
+#ifdef STAR_SYSTEM_SWITCH
+    // These hold TexturePtrs, so TTL cleanup cannot drop the atlas pages
+    // until the buffers themselves are gone.
+    m_parallaxBuffers.clear();
+#endif
+    m_starTextures.clear();
+    m_starsHash = 0;
+  }
   m_textureGroup->cleanup(textureTimeout);
 }
 

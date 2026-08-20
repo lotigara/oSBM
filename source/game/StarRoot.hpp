@@ -6,6 +6,8 @@
 #include "StarListener.hpp"
 #include "StarConfiguration.hpp"
 
+#include <atomic>
+
 namespace Star {
 
 STAR_CLASS(ItemDatabase);
@@ -126,6 +128,12 @@ public:
   // loaded.
   void fullyLoad();
 
+  // Drop unreferenced asset-cache entries, the Json intern table, and
+  // allocator span caches. A world visit pulls in its own working set; those
+  // leftovers pin rpmalloc spans so freeing the world does not shrink RSS
+  // until this runs.
+  void reclaimAfterWorldUnload();
+
   // Add a listener that will be called on Root reload.  Automatically managed,
   // if the listener is destroyed then it will automatically be removed from
   // the internal listener list.
@@ -215,6 +223,10 @@ private:
   Mutex m_maintenanceStopMutex;
   ConditionVariable m_maintenanceStopCondition;
   bool m_stopMaintenanceThread;
+  // Item/object/monster cleanup walks every loaded config. Skip it while
+  // fullyLoad is still inserting them — the walk stalls the loaders and
+  // evicts nothing useful until load finishes.
+  std::atomic<bool> m_fullyLoading{false};
 
   AssetsPtr m_assets;
   Mutex m_assetsMutex;

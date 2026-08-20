@@ -1,6 +1,9 @@
 #include "StarWorldClient.hpp"
+
+#include <atomic>
 #include "StarIterator.hpp"
 #include "StarLogging.hpp"
+#include "StarRoot.hpp"
 #include "StarBiome.hpp"
 #include "StarMaterialRenderProfile.hpp"
 #include "StarLiquidTypes.hpp"
@@ -21,14 +24,25 @@
 #include "StarStoredFunctions.hpp"
 #include "StarInspectableEntity.hpp"
 #include "StarCurve25519.hpp"
+#include "StarMemoryDomain.hpp"
 
 namespace Star {
+
+// Live WorldClient instances, the client-side counterpart to
+// worldServerLiveCount(). The client holds its own full copy of a world, so a
+// leak on either side looks the same from outside the process.
+std::atomic<int>& worldClientLiveCount() {
+  static std::atomic<int> count{0};
+  return count;
+}
+
 
 const std::string SECRET_BROADCAST_PUBLIC_KEY = "SecretBroadcastPublicKey";
 const std::string SECRET_BROADCAST_PREFIX = "\0Broadcast\0"s;
 
 const float WorldClient::DropDist = 6.0f;
 WorldClient::WorldClient(PlayerPtr mainPlayer, LuaRootPtr luaRoot) {
+  worldClientLiveCount().fetch_add(1, std::memory_order_relaxed);
   auto& root = Root::singleton();
   auto assets = root.assets();
 
@@ -99,6 +113,7 @@ WorldClient::WorldClient(PlayerPtr mainPlayer, LuaRootPtr luaRoot) {
 }
 
 WorldClient::~WorldClient() {
+  worldClientLiveCount().fetch_sub(1, std::memory_order_relaxed);
   if (m_lightingThread) {
     m_stopLightingThread = true;
     {
@@ -113,6 +128,12 @@ WorldClient::~WorldClient() {
 
 bool WorldClient::inWorld() const {
   return m_inWorld;
+}
+
+bool WorldClient::pullWorldCleared() {
+  bool cleared = m_worldCleared;
+  m_worldCleared = false;
+  return cleared;
 }
 
 bool WorldClient::inSpace() const {
@@ -524,6 +545,8 @@ void WorldClient::render(WorldRenderData& renderData, unsigned bufferTiles) {
   renderData.clear();
   if (!inWorld())
     return;
+
+  MemoryDomain memoryDomain(m_memoryHeap);
 
   // Self-measured frame pacing, used below to adaptively engage the
   // peripheral-entity render throttle only when this specific run is
@@ -1155,12 +1178,17 @@ void WorldClient::handleIncomingPackets(List<PacketPtr> const& packets) {
 
     if (auto worldStartPacket = as<WorldStartPacket>(packet)) {
       initWorld(*worldStartPacket);
+      continue;
 
     } else if (auto worldStopPacket = as<WorldStopPacket>(packet)) {
       Logger::info("Client received world stop packet, leaving: {}", worldStopPacket->reason);
       clearWorld();
+      continue;
+    }
 
-    } else if (auto entityCreate = as<EntityCreatePacket>(packet)) {
+    MemoryDomain memoryDomain(m_memoryHeap);
+
+    if (auto entityCreate = as<EntityCreatePacket>(packet)) {
       if (m_entityMap->entity(entityCreate->entityId)) {
         Logger::error("WorldClient received entity create packet with duplicate entity id {}, deleting old entity.", entityCreate->entityId);
         removeEntity(entityCreate->entityId, false);
@@ -1482,6 +1510,8 @@ void WorldClient::update(float dt) {
   ++m_renderTickStamp;
   if (!inWorld())
     return;
+
+  MemoryDomain memoryDomain(m_memoryHeap);
 
   auto assets = Root::singleton().assets();
 
@@ -2224,6 +2254,8 @@ void WorldClient::lightingMain() {
 
 void WorldClient::initWorld(WorldStartPacket const& startPacket) {
   clearWorld();
+  m_memoryHeap = memoryDomainAcquireHeap();
+  MemoryDomain memoryDomain(m_memoryHeap);
   m_outgoingPackets.append(make_shared<WorldStartAcknowledgePacket>());
 
   auto assets = Root::singleton().assets();
@@ -2324,6 +2356,9 @@ void WorldClient::initWorld(WorldStartPacket const& startPacket) {
 }
 
 void WorldClient::clearWorld() {
+  MemoryDomain memoryDomain(m_memoryHeap);
+  bool wasInWorld = m_inWorld;
+
   if (m_entityMap) {
     while (m_entityMap->size() > 0) {
       for (auto entityId : m_entityMap->entityIds())
@@ -2375,8 +2410,45 @@ void WorldClient::clearWorld() {
   }
 
   m_entityMessageResponses = {};
+  m_entityInteractionResponses = {};
+  m_findUniqueEntityResponses.clear();
 
   m_forceRegions.clear();
+
+  m_peripheralRenderCache.clear();
+  m_renderPositionHistory.clear();
+  m_predictedTiles.clear();
+  m_damagedBlocks.clear();
+  m_requestedDrops.clear();
+  m_startupHiddenEntities.clear();
+  m_previewTiles.clear();
+  m_pendingLights.clear();
+  m_pendingParticleLights.clear();
+  m_lightMap = Lightmap();
+  m_pendingLightMap = Lightmap();
+  m_samples.clear();
+  m_music.clear();
+  m_timers.clear();
+  m_damageNumbers.clear();
+  m_particleSnapshot.clear();
+  m_parallaxLayersBuffer.clear();
+  m_parallaxLayerBaseAlpha.clear();
+  m_parallaxLayerTodFunctions.clear();
+  m_parallaxBuiltFrom = nullptr;
+  m_nullCollisionScratch.clear();
+  m_centralStructure = WorldStructure();
+  m_dungeonIdGravity.clear();
+  m_dungeonIdBreathable.clear();
+  m_protectedDungeonIds.clear();
+
+  if (wasInWorld) {
+    m_worldCleared = true;
+    if (m_luaRoot)
+      m_luaRoot->collectGarbage();
+    Root::singleton().reclaimAfterWorldUnload();
+  }
+  memoryDomainReleaseHeap(m_memoryHeap);
+  m_memoryHeap = nullptr;
 }
 
 void WorldClient::tryGiveMainPlayerItem(ItemPtr item, bool silent) {

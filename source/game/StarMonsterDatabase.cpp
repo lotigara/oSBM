@@ -12,6 +12,16 @@
 namespace Star {
 
 MonsterDatabase::MonsterDatabase() : m_rebuilder(make_shared<Rebuilder>("monster")) {
+  // Keyed by (type, seed, parameters), and the seed is per spawn -- so every
+  // monster that has ever spawned mints its own entry holding a whole
+  // MonsterVariant, and the key space is unbounded by construction. Without a
+  // ceiling this grows for as long as the session lasts.
+#ifdef STAR_SYSTEM_FAMILY_MOBILE
+  m_monsterCache.setMaxSize(128);
+#else
+  m_monsterCache.setMaxSize(1024);
+#endif
+
   auto assets = Root::singleton().assets();
 
   auto& monsterTypes = assets->scanExtension("monstertype");

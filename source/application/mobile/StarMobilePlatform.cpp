@@ -5,6 +5,7 @@
 #include "StarImage.hpp"
 #include "StarJsonExtra.hpp"
 #include "StarLogging.hpp"
+#include "StarMemoryUsage.hpp"
 #include "StarRenderer_gles.hpp"
 #include "StarSignalHandler.hpp"
 #include "StarTickRateMonitor.hpp"
@@ -182,6 +183,39 @@ String getMobileStartupStatus();
 void setMobileStartupStatus(String const& status);
 
 namespace {
+
+// Default soft ceiling for the asset cache, in MB. The Switch's application
+// pool is a hard ~3.2GB and the GL driver shares it, so a heavily modded load
+// order can walk the process into an allocation failure with no warning; a
+// ceiling turns that into eviction. Phones vary far more, so they get a looser
+// default, and desktop launcher builds get none.
+// Soft ceiling for the asset cache. This is pure cache -- everything in it can
+// be re-read from the pak -- so on a device with a hard memory ceiling it
+// competes directly with the world the player is standing in. The old Switch
+// default of 512MB was 16% of the console's entire 3189MB application pool, and
+// hardware logs showed it sitting at 488MB while the process died at 96%.
+int defaultAssetCacheMB() {
+#if defined(STAR_SYSTEM_SWITCH)
+  return 128;
+#elif defined(STAR_SYSTEM_ANDROID) || defined(STAR_SYSTEM_IOS)
+  return 128;
+#else
+  return 0;
+#endif
+}
+
+// Hard upper bound applied on top of whatever is stored in the config. Without
+// this, an install that already saved the old default keeps paying it forever:
+// the stored value wins over the default above.
+int maxAssetCacheMB() {
+#if defined(STAR_SYSTEM_SWITCH)
+  return 128;
+#elif defined(STAR_SYSTEM_ANDROID) || defined(STAR_SYSTEM_IOS)
+  return 512;
+#else
+  return 0;
+#endif
+}
 
 struct LauncherModEntry {
   String displayName;
@@ -1262,6 +1296,10 @@ private:
     }
     m_perfSimRate = config.queryInt("performance.simRate", 60) == 30 ? 30 : 60;
     m_perfFpsCap = std::max(0, (int)config.queryInt("performance.fpsCap", 0));
+    m_perfAssetCacheMB = std::max(0, (int)config.queryInt("performance.assetCacheMB", defaultAssetCacheMB()));
+    if (int cap = maxAssetCacheMB())
+      m_perfAssetCacheMB = std::min(m_perfAssetCacheMB, cap);
+    m_perfSmallTextureAtlas = config.queryBool("performance.smallTextureAtlas", false);
     m_fullscreenRender = config.queryBool("display.fullscreenRender", false);
 #ifdef STAR_SYSTEM_SWITCH
     // The Switch panel is fixed 60Hz: rendering past it can't be displayed
@@ -2603,14 +2641,49 @@ private:
       // No shape at runtime (it's a passive display, not a touch target) --
       // show representative placeholder text instead, so the preview looks
       // like what actually renders in-game while positioning it.
-      String placeholder = element.perfCounterMode == PerformanceCounterMode::Detailed
-          ? String("60 FPS\n60.00Hz\n00512µs\n00048µs")
-          : String("60 FPS");
+      String placeholder = String("60 FPS");
+      if (element.perfCounterMode == PerformanceCounterMode::Detailed)
+        placeholder = String("60 FPS\n60.00Hz\n00512µs\n00048µs");
+      else if (element.perfCounterMode == PerformanceCounterMode::Memory)
+        placeholder = String("60 FPS\nRAM 1200/3200MB (37%)\nimg 240MB tex 320MB");
       labels.push_back({ImVec2(center.x - radius * 0.55f, center.y - radius * 0.4f), placeholder});
     } else {
       draw->AddCircleFilled(center, radius * 0.55f, fill, 32);
       draw->AddCircle(center, radius * 0.55f, base, 48, thickness);
       labels.push_back({ImVec2(center.x - radius * 0.22f, center.y - radius * 0.18f), element.label});
+    }
+  }
+
+  // One combo shared by the layout preview and the element list -- they edit
+  // the same field, and keeping two copies is how one of them ends up missing
+  // a mode.
+  void perfCounterModeCombo(PerformanceCounterMode& mode) {
+    // Store as String, not char const*: .utf8Ptr() on a launcherText()
+    // temporary dangles the instant the initializer statement ends, since the
+    // String owning that buffer is destroyed right there -- BeginCombo below
+    // would read freed memory (this was the "dropdown shows its own label
+    // instead of the selected value" bug).
+    PerformanceCounterMode const modes[] = {
+      PerformanceCounterMode::Fps, PerformanceCounterMode::Detailed, PerformanceCounterMode::Memory};
+    auto modeText = [this](PerformanceCounterMode m) {
+      if (m == PerformanceCounterMode::Detailed)
+        return launcherText("touchManager.perfCounterModeDetailed", "Detailed");
+      if (m == PerformanceCounterMode::Memory)
+        return launcherText("touchManager.perfCounterModeMemory", "Memory (RAM)");
+      return launcherText("touchManager.perfCounterModeFps", "FPS");
+    };
+
+    String modeLabel = modeText(mode);
+    if (ImGui::BeginCombo(launcherText("touchManager.perfCounterMode", "Display mode").utf8Ptr(), modeLabel.utf8Ptr())) {
+      for (auto candidate : modes) {
+        bool itemSelected = mode == candidate;
+        String label = modeText(candidate);
+        if (ImGui::Selectable(label.utf8Ptr(), itemSelected))
+          mode = candidate;
+        if (itemSelected)
+          ImGui::SetItemDefaultFocus();
+      }
+      ImGui::EndCombo();
     }
   }
 
@@ -2639,31 +2712,8 @@ private:
       auto& selected = state.touchElements[state.selectedTouchElement];
       ImGui::Text("%s: %s", launcherText("touchPreview.selectedLabel", "Selected").utf8Ptr(), selected.label.utf8Ptr());
       ImGui::SliderFloat(launcherText("touchPreview.selectedSize", "Selected size").utf8Ptr(), &selected.size, 0.45f, 2.4f);
-      if (selected.kind == MobileTouchElementKind::PerformanceCounter) {
-        bool detailed = selected.perfCounterMode == PerformanceCounterMode::Detailed;
-        // Store as String, not char const*: .utf8Ptr() on a launcherText()
-        // temporary dangles the instant the initializer statement ends, since
-        // the String owning that buffer is destroyed right there -- BeginCombo
-        // below would read freed memory (this was the "dropdown shows its own
-        // label instead of the selected value" bug).
-        String modeLabel = detailed
-            ? launcherText("touchManager.perfCounterModeDetailed", "Detailed")
-            : launcherText("touchManager.perfCounterModeFps", "FPS");
-        if (ImGui::BeginCombo(launcherText("touchManager.perfCounterMode", "Display mode").utf8Ptr(), modeLabel.utf8Ptr())) {
-          for (int i = 0; i < 2; ++i) {
-            bool isDetailed = i == 1;
-            bool itemSelected = detailed == isDetailed;
-            String label = isDetailed
-                ? launcherText("touchManager.perfCounterModeDetailed", "Detailed")
-                : launcherText("touchManager.perfCounterModeFps", "FPS");
-            if (ImGui::Selectable(label.utf8Ptr(), itemSelected))
-              selected.perfCounterMode = isDetailed ? PerformanceCounterMode::Detailed : PerformanceCounterMode::Fps;
-            if (itemSelected)
-              ImGui::SetItemDefaultFocus();
-          }
-          ImGui::EndCombo();
-        }
-      }
+      if (selected.kind == MobileTouchElementKind::PerformanceCounter)
+        perfCounterModeCombo(selected.perfCounterMode);
     }
     if (ImGui::Button(launcherText("common.done", "Done").utf8Ptr()))
       state.touchPreviewOpen = false;
@@ -2813,6 +2863,64 @@ private:
         }
         ImGui::EndCombo();
       }
+    }
+
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+    ImGui::TextUnformatted(launcherText("uiSettings.memory", "Memory").utf8Ptr());
+    ImGui::Separator();
+
+    // Live reading so the numbers here mean something while you pick a limit;
+    // this screen is also where a player lands after an out-of-memory crash.
+    {
+      auto usage = memoryUsageCached();
+      auto mb = [](uint64_t bytes) { return (unsigned)(bytes / (1024 * 1024)); };
+      if (usage.valid() && usage.budget)
+        ImGui::Text("%s: %u / %u MB", launcherText("uiSettings.memoryInUse", "In use").utf8Ptr(),
+            mb(usage.used), mb(usage.budget));
+      else if (usage.valid())
+        ImGui::Text("%s: %u MB", launcherText("uiSettings.memoryInUse", "In use").utf8Ptr(), mb(usage.used));
+    }
+
+    // Ceiling on decompressed asset data (sprite sheets dominate it). Past the
+    // ceiling the least recently used entries are dropped; they reload from
+    // disk on demand, so too low a value trades RAM for load hitches.
+    {
+      static int const cacheChoices[] = {0, 64, 96, 128, 192, 256};
+      int cacheIndex = 0;
+      for (int i = 0; i < (int)(sizeof(cacheChoices) / sizeof(cacheChoices[0])); ++i) {
+        if (cacheChoices[i] == m_perfAssetCacheMB) {
+          cacheIndex = i;
+          break;
+        }
+      }
+      auto cacheLabel = [&](int mb) {
+        return mb == 0 ? launcherText("uiSettings.assetCacheUnlimited", "No limit") : strf("{} MB", mb);
+      };
+      if (ImGui::BeginCombo(launcherText("uiSettings.assetCache", "Asset cache limit").utf8Ptr(),
+              cacheLabel(cacheChoices[cacheIndex]).utf8Ptr())) {
+        for (int i = 0; i < (int)(sizeof(cacheChoices) / sizeof(cacheChoices[0])); ++i) {
+          bool selected = cacheIndex == i;
+          if (ImGui::Selectable(cacheLabel(cacheChoices[i]).utf8Ptr(), selected)) {
+            m_perfAssetCacheMB = cacheChoices[i];
+            persistLauncherState(state);
+          }
+          if (selected)
+            ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+      }
+      ImGui::TextDisabled("%s", launcherText("uiSettings.assetCacheHint",
+          "Caps decompressed images and sounds held in RAM. Lower if heavy mod packs run out of memory; raise it if you see reload stutter. Takes effect on next launch.").utf8Ptr());
+    }
+
+    {
+      bool small = m_perfSmallTextureAtlas;
+      if (ImGui::Checkbox(launcherText("uiSettings.smallTextureAtlas", "Smaller texture pages").utf8Ptr(), &small)) {
+        m_perfSmallTextureAtlas = small;
+        persistLauncherState(state);
+      }
+      ImGui::TextDisabled("%s", launcherText("uiSettings.smallTextureAtlasHint",
+          "Uses 2048x2048 instead of 4096x4096 texture pages: less memory wasted on partly-filled pages, slightly more draw work. Takes effect on next launch.").utf8Ptr());
     }
 
     ImGui::EndChild();
@@ -2980,26 +3088,7 @@ private:
             else
               ImGui::TextDisabled("%s", launcherText("touchManager.directionalAimHint", "Directional aim points around the player.").utf8Ptr());
           } else if (element.kind == MobileTouchElementKind::PerformanceCounter) {
-            bool detailed = element.perfCounterMode == PerformanceCounterMode::Detailed;
-            // Store as String, not char const*: .utf8Ptr() on a launcherText()
-            // temporary dangles the instant this initializer statement ends.
-            String modeLabel = detailed
-                ? launcherText("touchManager.perfCounterModeDetailed", "Detailed")
-                : launcherText("touchManager.perfCounterModeFps", "FPS");
-            if (ImGui::BeginCombo(launcherText("touchManager.perfCounterMode", "Display mode").utf8Ptr(), modeLabel.utf8Ptr())) {
-              for (int i = 0; i < 2; ++i) {
-                bool isDetailed = i == 1;
-                bool itemSelected = detailed == isDetailed;
-                String label = isDetailed
-                    ? launcherText("touchManager.perfCounterModeDetailed", "Detailed")
-                    : launcherText("touchManager.perfCounterModeFps", "FPS");
-                if (ImGui::Selectable(label.utf8Ptr(), itemSelected))
-                  element.perfCounterMode = isDetailed ? PerformanceCounterMode::Detailed : PerformanceCounterMode::Fps;
-                if (itemSelected)
-                  ImGui::SetItemDefaultFocus();
-              }
-              ImGui::EndCombo();
-            }
+            perfCounterModeCombo(element.perfCounterMode);
           } else {
             ImGui::TextDisabled("%s", launcherText("touchManager.joystickHint", "Joystick sends movement keys.").utf8Ptr());
           }
@@ -3838,7 +3927,9 @@ private:
       }},
       {"performance", JsonObject{
         {"simRate", m_perfSimRate},
-        {"fpsCap", m_perfFpsCap}
+        {"fpsCap", m_perfFpsCap},
+        {"assetCacheMB", m_perfAssetCacheMB},
+        {"smallTextureAtlas", m_perfSmallTextureAtlas}
       }},
       {"display", JsonObject{
         {"fullscreenRender", m_fullscreenRender}
@@ -3906,7 +3997,8 @@ private:
         {"skipDigest", true},
         {"skipPreload", true},
         {"digestIgnore", JsonArray{".*"}},
-        {"workerPoolSize", workerPoolSize}
+        {"workerPoolSize", workerPoolSize},
+        {"memoryLimitMB", m_perfAssetCacheMB}
       }},
       {"storageDirectory", m_storageRoot},
       {"logDirectory", File::relativeTo(m_storageRoot, "logs")},
@@ -4042,6 +4134,11 @@ private:
       m_application->applicationInit(m_appController);
       setMobileStartupStatus(launcherText("startup.initRenderer", "Initializing renderer..."));
       renderStartupScreen(getMobileStartupStatus());
+      // Before renderInit: texture groups are created during it, and the
+      // renderer's own config read only ever turns the limit ON, so the
+      // launcher choice cannot be clobbered here.
+      if (m_perfSmallTextureAtlas)
+        m_renderer->setSizeLimitEnabled(true);
       androidLogInfo("startApplication: renderInit");
       m_application->renderInit(m_renderer);
       setMobileStartupStatus("Renderer initialized...");
@@ -5238,6 +5335,12 @@ private:
   // launcher UI is the settings surface users actually see here).
   int m_perfSimRate = 60; // simulation tick rate: 30 or 60
   int m_perfFpsCap = 0;   // rendered FPS cap; 0 = unlimited
+  // Soft ceiling in MB for decompressed asset data; 0 = no ceiling (TTL only).
+  int m_perfAssetCacheMB = defaultAssetCacheMB();
+  // Halve the atlas page dimension (4096 -> 2048): less memory wasted on
+  // partly-filled atlas pages, at the cost of more pages and more texture
+  // binds per frame.
+  bool m_perfSmallTextureAtlas = false;
   // Fullscreen rendering ignores safe-area insets: the game fills the whole
   // panel and the notch / camera cutout may overlap content. Default OFF so
   // existing installs keep the inset (letterboxed) behavior they have today.

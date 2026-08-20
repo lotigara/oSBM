@@ -51,6 +51,7 @@ SET (star_core_HEADERS
     StarJson.hpp
     StarJsonBuilder.hpp
     StarJsonExtra.hpp
+    StarJsonIntern.hpp
     StarJsonParser.hpp
     StarJsonPath.hpp
     StarJsonPatch.hpp
@@ -70,6 +71,10 @@ SET (star_core_HEADERS
     StarMatrix3.hpp
     StarMaybe.hpp
     StarMemory.hpp
+    StarMemoryDomain.hpp
+    StarAllocProfile.hpp
+    StarDiagnostics.hpp
+    StarMemoryUsage.hpp
     StarMiniDump.hpp
     StarMultiArray.hpp
     StarMultiArrayInterpolator.hpp
@@ -163,6 +168,7 @@ SET (star_core_SOURCES
     StarJson.cpp
     StarJsonBuilder.cpp
     StarJsonExtra.cpp
+    StarJsonIntern.cpp
     StarJsonPath.cpp
     StarJsonPatch.cpp
     StarJsonRpc.cpp
@@ -173,6 +179,10 @@ SET (star_core_SOURCES
     StarLua.cpp
     StarLuaConverters.cpp
     StarMemory.cpp
+    StarMemoryDomain.cpp
+    StarAllocProfile.cpp
+    StarDiagnostics.cpp
+    StarMemoryUsage.cpp
     StarNetCompatibility.cpp
     StarNetElement.cpp
     StarNetElementBasicFields.cpp

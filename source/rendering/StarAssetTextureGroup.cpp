@@ -45,7 +45,7 @@ void AssetTextureGroup::cleanup(int64_t textureTimeout) {
     liveTextures.sort();
 
     eraseWhere(m_textureDeduplicationMap, [&](auto const& p) {
-        return !liveTextures.containsSorted(p.second.get());
+        return p.second.first.expired() || !liveTextures.containsSorted(p.second.second.get());
       });
   }
 }
@@ -71,15 +71,21 @@ TexturePtr AssetTextureGroup::loadTexture(AssetPath const& imagePath, bool tryTe
   // to the same underlying cached image.  We should not make duplicate entries
   // in the texture group for these, so we keep track of the image pointers
   // returned to deduplicate them.
-  if (auto existingTexture = m_textureDeduplicationMap.value(image)) {
-    m_textureMap.add(imagePath, {existingTexture, Time::monotonicMilliseconds()});
-    return existingTexture;
-  } else {
-    auto texture = m_textureGroup->create(*image);
-    m_textureMap.add(imagePath, {texture, Time::monotonicMilliseconds()});
-    m_textureDeduplicationMap.add(image, texture);
-    return texture;
+  if (auto existing = m_textureDeduplicationMap.ptr(image.get())) {
+    // Only a live weak_ptr to this exact image proves the raw key was not
+    // recycled by an unrelated allocation at the same address.
+    if (existing->first.lock() == image) {
+      auto existingTexture = existing->second;
+      m_textureMap.add(imagePath, {existingTexture, Time::monotonicMilliseconds()});
+      return existingTexture;
+    }
+    m_textureDeduplicationMap.remove(image.get());
   }
+
+  auto texture = m_textureGroup->create(*image);
+  m_textureMap.add(imagePath, {texture, Time::monotonicMilliseconds()});
+  m_textureDeduplicationMap.add(image.get(), {weak_ptr<Image const>(image), texture});
+  return texture;
 }
 
 }

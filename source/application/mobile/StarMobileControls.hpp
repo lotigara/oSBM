@@ -123,7 +123,11 @@ enum class MobileTouchElementKind {
 
 enum class PerformanceCounterMode {
   Fps,
-  Detailed
+  Detailed,
+  // Used RAM against the platform's ceiling, plus the two caches that make up
+  // most of it. The point is to see an out-of-memory crash coming and know
+  // which memory setting to turn down before it happens.
+  Memory
 };
 
 enum class MobileTouchPressMode {

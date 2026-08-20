@@ -149,7 +149,10 @@ bool MapMixin<BaseMap>::removeValues(mapped_type const& v) {
   const_iterator i = Base::begin();
   while (i != Base::end()) {
     if (i->second == v) {
-      Base::erase(i++);
+      // erase() returns the following element for std::map, FlatHashMap and
+      // FlatSortedMap alike. The old `erase(i++)` form assumes the container
+      // never moves its elements, which is false for a vector-backed map.
+      i = Base::erase(i);
       removed = true;
     } else {
       ++i;

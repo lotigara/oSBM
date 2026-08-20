@@ -140,7 +140,7 @@ public:
 private:
   struct BuildContext;
 
-  StringMap<Json> m_configs;
+  JsonObject m_configs;
   mutable StringMap<BehaviorTreeConstPtr> m_behaviors;
   mutable Mutex m_behaviorsMutex;
   StringMap<StringMap<NodeParameter>> m_nodeParameters;

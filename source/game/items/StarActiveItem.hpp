@@ -92,7 +92,7 @@ private:
   NetElementData<List<PolyF>> m_itemShieldPolys;
   NetElementData<List<PhysicsForceRegion>> m_forceRegions;
   NetElementData<List<PhysicsForceRegion>> m_itemForceRegions;
-  NetElementHashMap<String, Json> m_scriptedAnimationParameters;
+  NetElementMapWrapper<JsonObject> m_scriptedAnimationParameters;
 };
 
 }

@@ -77,6 +77,13 @@ public:
 
     // If true, skip reading /preload.config startup entries.
     bool skipPreload = false;
+
+    // Soft ceiling in bytes for cached asset data. 0 disables the ceiling and
+    // leaves eviction purely TTL-based (the desktop default and the vanilla
+    // behavior). When set, cleanup() evicts least-recently-used non-shared
+    // entries until the cache fits, which is what keeps a heavily modded load
+    // order from walking a 3GB device into an out-of-memory abort.
+    uint64_t memoryLimit = 0;
   };
 
   enum class QueuePriority {
@@ -113,6 +120,11 @@ public:
     // the cache.
     virtual bool shouldPersist() const = 0;
 
+    // Approximate resident bytes this entry owns, for the memory ceiling and
+    // the RAM indicator. Approximate is fine: it only has to rank entries and
+    // track the order of magnitude.
+    virtual size_t memoryBytes() const = 0;
+
     double time = 0.0;
     bool needsPostProcessing = false;
     bool forcePersist = false;
@@ -120,6 +132,7 @@ public:
 
   struct JsonData : AssetData {
     bool shouldPersist() const override;
+    size_t memoryBytes() const override;
 
     Json json;
   };
@@ -127,6 +140,7 @@ public:
   // Image data for an image, sub-frame, or post-processed image.
   struct ImageData : AssetData {
     bool shouldPersist() const override;
+    size_t memoryBytes() const override;
 
     ImageConstPtr image;
 
@@ -142,18 +156,21 @@ public:
 
   struct AudioData : AssetData {
     bool shouldPersist() const override;
+    size_t memoryBytes() const override;
 
     AudioConstPtr audio;
   };
 
   struct FontData : AssetData {
     bool shouldPersist() const override;
+    size_t memoryBytes() const override;
 
     FontConstPtr font;
   };
 
   struct BytesData : AssetData {
     bool shouldPersist() const override;
+    size_t memoryBytes() const override;
 
     ByteArrayConstPtr bytes;
   };

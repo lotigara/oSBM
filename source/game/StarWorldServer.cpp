@@ -1,4 +1,7 @@
 #include "StarWorldServer.hpp"
+#include "StarMemoryDomain.hpp"
+
+#include <atomic>
 #include "StarLogging.hpp"
 #include "StarIterator.hpp"
 #include "StarDataStreamExtra.hpp"
@@ -27,6 +30,16 @@
 
 namespace Star {
 
+// How many WorldServer objects exist right now. A world is the single largest
+// thing the engine allocates (tile sectors, entities, storage buffers), so if
+// unloading one does not drop this, nothing else about the memory figures
+// matters until that is explained.
+std::atomic<int>& worldServerLiveCount() {
+  static std::atomic<int> count{0};
+  return count;
+}
+
+
 EnumMap<WorldServerFidelity> const WorldServerFidelityNames{
   {WorldServerFidelity::Minimum, "minimum"},
   {WorldServerFidelity::Low, "low"},
@@ -35,6 +48,11 @@ EnumMap<WorldServerFidelity> const WorldServerFidelityNames{
 };
 
 WorldServer::WorldServer(WorldTemplatePtr const& worldTemplate, IODevicePtr storage) {
+  // Acquired before anything else so construction -- tile arrays, storage
+  // buffers, the initial entity set -- lands in this world's heap too.
+  m_memoryHeap = memoryDomainAcquireHeap();
+  MemoryDomain memoryDomain(m_memoryHeap);
+  worldServerLiveCount().fetch_add(1, std::memory_order_relaxed);
   m_worldTemplate = worldTemplate;
   m_worldStorage = make_shared<WorldStorage>(m_worldTemplate->size(), storage, make_shared<WorldGenerator>(this));
   m_adjustPlayerStart = true;
@@ -52,6 +70,11 @@ WorldServer::WorldServer(Vec2U const& size, IODevicePtr storage)
   : WorldServer(make_shared<WorldTemplate>(size), storage) {}
 
 WorldServer::WorldServer(IODevicePtr const& storage) {
+  // Acquired before anything else so construction -- tile arrays, storage
+  // buffers, the initial entity set -- lands in this world's heap too.
+  m_memoryHeap = memoryDomainAcquireHeap();
+  MemoryDomain memoryDomain(m_memoryHeap);
+  worldServerLiveCount().fetch_add(1, std::memory_order_relaxed);
   m_worldStorage = make_shared<WorldStorage>(storage, make_shared<WorldGenerator>(this));
   m_tileProtectionEnabled = true;
   m_universeSettings = make_shared<UniverseSettings>();
@@ -62,6 +85,11 @@ WorldServer::WorldServer(IODevicePtr const& storage) {
 }
 
 WorldServer::WorldServer(WorldChunks const& chunks) {
+  // Acquired before anything else so construction -- tile arrays, storage
+  // buffers, the initial entity set -- lands in this world's heap too.
+  m_memoryHeap = memoryDomainAcquireHeap();
+  MemoryDomain memoryDomain(m_memoryHeap);
+  worldServerLiveCount().fetch_add(1, std::memory_order_relaxed);
   m_worldStorage = make_shared<WorldStorage>(chunks, make_shared<WorldGenerator>(this));
   m_tileProtectionEnabled = true;
   m_universeSettings = make_shared<UniverseSettings>();
@@ -72,6 +100,10 @@ WorldServer::WorldServer(WorldChunks const& chunks) {
 }
 
 WorldServer::~WorldServer() {
+  worldServerLiveCount().fetch_sub(1, std::memory_order_relaxed);
+  // Teardown frees this world's data, and doing it with the world's heap
+  // current keeps any transient allocation out of the shared heaps.
+  MemoryDomain memoryDomain(m_memoryHeap);
   for (auto& p : m_scriptContexts)
     p.second->uninit();
 
@@ -79,6 +111,14 @@ WorldServer::~WorldServer() {
   m_spawner.uninit();
   writeMetadata();
   m_worldStorage->unloadAll(true);
+
+  // Hand the heap back for reuse. Per rpmalloc's contract this does NOT free
+  // anything still allocated from it -- blocks that outlive the world stay
+  // valid and resolve to this heap when freed, exactly as they do for a thread
+  // heap after the thread exits. Members are destroyed after this point and
+  // their frees are safe for the same reason.
+  memoryDomainReleaseHeap(m_memoryHeap);
+  m_memoryHeap = nullptr;
 }
 
 void WorldServer::setWorldId(String worldId) {
@@ -612,6 +652,9 @@ float WorldServer::expiryTime() {
 }
 
 void WorldServer::update(float dt) {
+  // Runs on this world's own WorldServerThread, which is what makes a
+  // single-owner rpmalloc heap safe here.
+  MemoryDomain memoryDomain(m_memoryHeap);
 #ifdef STAR_SYSTEM_SWITCH
   // Server tick phase breakdown ([perf-wsu]), logged every ~150 ticks.
   static int64_t s_wsuTicks = 0, s_wsuEntities = 0, s_wsuLiquid = 0, s_wsuStorage = 0, s_wsuNet = 0, s_wsuRest = 0;

@@ -41,7 +41,14 @@ private:
 
   TextureGroupPtr m_textureGroup;
   HashMap<AssetPath, pair<TexturePtr, int64_t>> m_textureMap;
-  HashMap<ImageConstPtr, TexturePtr> m_textureDeduplicationMap;
+  // Deduplication only needs image IDENTITY, never image pixels. Holding an
+  // ImageConstPtr here used to pin every decompressed source image in the
+  // Assets cache for as long as its texture lived (Assets keeps anything whose
+  // shared_ptr is not unique), so each on-screen sprite cost a full RGBA copy
+  // in RAM on top of its atlas copy. The weak_ptr keeps the identity check
+  // exact -- a raw key can be reused by a later allocation, so a hit is only
+  // trusted when the weak_ptr still locks to the very same image.
+  HashMap<Image const*, pair<weak_ptr<Image const>, TexturePtr>> m_textureDeduplicationMap;
   TrackerListenerPtr m_reloadTracker;
 };
 

@@ -4,6 +4,7 @@
 #include "StarFile.hpp"
 #include "StarJsonExtra.hpp"
 #include "StarLogging.hpp"
+#include "StarMemoryUsage.hpp"
 #include "StarRenderer_gles.hpp"
 #include "StarSignalHandler.hpp"
 #include "StarTickRateMonitor.hpp"
@@ -186,6 +187,8 @@ String perfCounterModeName(PerformanceCounterMode mode) {
   switch (mode) {
     case PerformanceCounterMode::Detailed:
       return "detailed";
+    case PerformanceCounterMode::Memory:
+      return "memory";
     default:
       return "fps";
   }
@@ -194,6 +197,8 @@ String perfCounterModeName(PerformanceCounterMode mode) {
 PerformanceCounterMode perfCounterModeFromName(String const& name, PerformanceCounterMode def) {
   if (name.equals("detailed", String::CaseInsensitive))
     return PerformanceCounterMode::Detailed;
+  if (name.equals("memory", String::CaseInsensitive))
+    return PerformanceCounterMode::Memory;
   if (name.equals("fps", String::CaseInsensitive))
     return PerformanceCounterMode::Fps;
   return def;
@@ -740,6 +745,22 @@ public:
 
   static String perfCounterText(PerformanceCounterMode mode, float fps) {
     String text = strf("{:.0f} FPS", fps);
+    if (mode == PerformanceCounterMode::Memory) {
+      // memoryUsageCached() rate-limits the OS query, so this is safe to build
+      // every frame.
+      auto usage = memoryUsageCached();
+      auto mb = [](uint64_t bytes) { return bytes / (1024 * 1024); };
+      if (!usage.valid())
+        text += "\nRAM n/a";
+      else if (usage.budget)
+        text += strf("\nRAM {}/{}MB ({:.0f}%)", mb(usage.used), mb(usage.budget), usage.fraction() * 100.0f);
+      else
+        text += strf("\nRAM {}MB", mb(usage.used));
+      text += strf("\nimg {}MB tex {}MB",
+          mb(memoryAccountBytes(MemoryCategory::AssetCache)),
+          mb(memoryAccountBytes(MemoryCategory::TextureAtlas)));
+      return text;
+    }
     if (mode == PerformanceCounterMode::Detailed) {
       // Reuses the same per-frame stats the vanilla debug HUD (F3-style
       // overlay, see MainInterface::renderDebug) already computes every

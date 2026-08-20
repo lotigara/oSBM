@@ -91,6 +91,7 @@ private:
   bool isActionTakenEdge(InterfaceAction action) const;
 
   void updateCamera(float dt);
+  void flushGpuAfterWorldLeave();
 
 #ifdef STAR_SYSTEM_SWITCH
   // One blocking software-keyboard session per textbox focus; see the
@@ -160,10 +161,22 @@ private:
   // "stay" idles on the ship; "warp=<action>" warps once after arrival.
   bool m_autopilotActive = false;
   bool m_autopilotStayOnShip = false;
+  bool m_autopilotSticky = false;
   String m_autopilotWarpTarget;
   // open=<pane> autopilot verb: "nav" opens the ship navigation ScriptPane
   // for unattended star-map performance measurement.
   String m_autopilotOpenPane;
+  // cycle=<seconds> autopilot verb: alternate ship <-> planet forever. World
+  // teardown is where memory that is never returned shows up (see the GH #48
+  // log: live heap climbs at every warp and never comes back), and that is
+  // invisible to a soak that stays in one world.
+  float m_autopilotCycleSeconds = 0.0f;
+  // scenario=<a,b,c> autopilot verb: rotate through these warp targets every
+  // cycle instead of the default ship<->planet alternation, so an unattended
+  // run covers the world types that actually break (instance dungeons like
+  // the outpost and the Erchius mission are far heavier than a planet).
+  StringList m_autopilotScenario;
+  size_t m_autopilotScenarioIndex = 0;
 #endif
   
   StringMap<PostProcessGroup> m_postProcessGroups;

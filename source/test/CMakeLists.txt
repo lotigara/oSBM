@@ -4,6 +4,10 @@ INCLUDE_DIRECTORIES (
     ${STAR_BASE_INCLUDES}
     ${STAR_PLATFORM_INCLUDES}
     ${STAR_GAME_INCLUDES}
+    # Set later in the top-level list than add_subdirectory(test), so spell it
+    # out rather than relying on the variable. Only texture_atlas_test.cpp
+    # needs it, and only for a header-only template.
+    ${PROJECT_SOURCE_DIR}/application
   )
 
 # Add top-level test directory so  gtest-all.cc can find its own include file
@@ -43,6 +47,7 @@ SET (star_core_tests_SOURCES
       poly_test.cpp
       random_test.cpp
       rect_test.cpp
+      texture_atlas_test.cpp
       serialization_test.cpp
       static_vector_test.cpp
       small_vector_test.cpp

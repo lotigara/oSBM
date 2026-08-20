@@ -159,12 +159,22 @@ private:
   struct GlTextureAtlasSet : public TextureAtlasSet<GLuint> {
   public:
     GlTextureAtlasSet(unsigned atlasNumCells);
+    ~GlTextureAtlasSet();
 
     GLuint createAtlasTexture(Vec2U const& size, PixelFormat pixelFormat) override;
     void destroyAtlasTexture(GLuint const& glTexture) override;
     void copyAtlasPixels(GLuint const& glTexture, Vec2U const& bottomLeft, Image const& image) override;
+    bool copyAtlasRegion(GLuint const& destTexture, Vec2U const& destBottomLeft,
+        GLuint const& sourceTexture, RectU const& sourceRegion) override;
 
     TextureFiltering textureFiltering;
+
+  private:
+    // Scratch FBO used only to make an atlas texture readable by
+    // glCopyTexSubImage2D. Created on first compaction, kept for the life of
+    // the group.
+    GLuint m_copyFbo = 0;
+    unsigned m_atlasBytes = 0;
   };
 
   struct GlTextureGroup : enable_shared_from_this<GlTextureGroup>, public TextureGroup {
@@ -218,6 +228,7 @@ private:
     TextureAddressing textureAddressing = TextureAddressing::Clamp;
     TextureFiltering textureFiltering = TextureFiltering::Nearest;
     PixelFormat storedPixelFormat = PixelFormat::RGBA32;
+    size_t textureBytes = 0;
   };
 
   struct GlPackedVertexData {

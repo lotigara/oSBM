@@ -59,6 +59,12 @@ IF (STAR_SYSTEM_SWITCH)
   # spontaneous system fatals carry caller attribution (see
   # StarSwitchPlatform.cpp __wrap_fatalThrow).
   TARGET_LINK_OPTIONS (starbound PRIVATE "-Wl,--wrap=fatalThrow")
+  # libnx exception.s svcBreaks if the userspace handler returns; that is
+  # the Atmosphere fatal overlay. Intercept it and return to hbloader.
+  TARGET_LINK_OPTIONS (starbound PRIVATE "-Wl,--wrap=svcBreak")
+  # The other overlay path: exception.s abort does
+  # svcReturnFromException(0xf801), which Atmosphere treats as unhandled.
+  TARGET_LINK_OPTIONS (starbound PRIVATE "-Wl,--wrap=svcReturnFromException")
   # libnx's internal result assertions abort via diagAbortWithResult (not the
   # public fatalThrow). Wrap it too: attribute + swallow the spurious post-warp
   # applet "NotInitialized" fatal (see __wrap_diagAbortWithResult).

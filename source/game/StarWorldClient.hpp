@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include "StarWorldClientState.hpp"
 #include "StarNetPackets.hpp"
 #include "StarWorldRenderData.hpp"
@@ -36,6 +38,8 @@ STAR_CLASS(PlayerStorage);
 STAR_STRUCT(OverheadBar);
 
 STAR_EXCEPTION(WorldClientException, StarException);
+
+std::atomic<int>& worldClientLiveCount();
 
 class WorldClient : public World {
 public:
@@ -108,6 +112,11 @@ public:
 
   // Is this WorldClient properly initialized in a world
   bool inWorld() const;
+
+  // True once after a live world was torn down. The client app pulls this to
+  // drop GPU textures the departing world loaded; WorldClient cannot see the
+  // painter.
+  bool pullWorldCleared();
 
   bool inSpace() const;
   bool flying() const;
@@ -451,10 +460,17 @@ private:
 
   List<PhysicsForceRegion> m_forceRegions;
 
+  // Client world's first-class heap. Tiles, packet-created entities and
+  // other in-world client data live here so leaving the world can unmap
+  // those spans. Null when first-class heaps are unavailable.
+  void* m_memoryHeap = nullptr;
+
   BroadcastCallback m_broadcastCallback;
 
   // used to keep track of already-printed stack traces caused by remote entities, so they don't clog the log
   HashSet<uint64_t> m_entityExceptionsLogged;
+
+  bool m_worldCleared = false;
 };
 
 }

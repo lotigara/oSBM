@@ -135,6 +135,13 @@ bool ItemDatabase::canMakeRecipe(ItemRecipe const& recipe, HashMap<ItemDescripto
 
 ItemDatabase::ItemDatabase()
   : m_luaRoot(make_shared<LuaRoot>()), m_rebuilder(make_shared<Rebuilder>("item")) {
+  // Keyed by descriptor plus parameters, so randomised and generated items each
+  // take their own slot and the key space is effectively unbounded.
+#ifdef STAR_SYSTEM_FAMILY_MOBILE
+  m_itemCache.setMaxSize(1024);
+#else
+  m_itemCache.setMaxSize(8192);
+#endif
   scanItems();
   addObjectItems();
   addCodexes();
@@ -143,10 +150,19 @@ ItemDatabase::ItemDatabase()
 }
 
 void ItemDatabase::cleanup() {
+  // Evicted items are released after the lock, not under it. Dropping an Item
+  // frees its whole config tree, and modded that measured 84ms per sweep with
+  // m_cacheMutex held -- every thread wanting an item stalled for it. Holding a
+  // second reference here keeps the entry alive past the erase so the
+  // destructor cost lands outside the critical section.
+  List<ItemPtr> doomed;
   {
     MutexLocker locker(m_cacheMutex);
-    m_itemCache.cleanup([](ItemCacheEntry const&, ItemPtr const& item) {
-      return !item.unique();
+    m_itemCache.cleanup([&doomed](ItemCacheEntry const&, ItemPtr const& item) {
+      if (!item.unique())
+        return true;
+      doomed.append(item);
+      return false;
     });
   }
 }

@@ -3,6 +3,7 @@
 #include "StarJsonExtra.hpp"
 #include "StarCasting.hpp"
 #include "StarLogging.hpp"
+#include "StarMemoryUsage.hpp"
 #ifdef STAR_SYSTEM_SWITCH
 #include <sys/stat.h>
 #endif
@@ -691,6 +692,10 @@ void OpenGlRenderer::setEffectTexture(String const& textureName, ImageView const
     ptr->textureValue->textureFiltering = effectiveTextureFiltering(image.format, ptr->textureFiltering);
     setTextureFiltering(ptr->textureValue->textureFiltering);
     uploadTextureImage(image.format, image.size, image.data, sameStorage);
+
+    size_t newBytes = (size_t)image.size[0] * image.size[1] * Star::bytesPerPixel(image.format);
+    memoryAccountAdd(MemoryCategory::TextureAtlas, (int64_t)newBytes - (int64_t)ptr->textureValue->textureBytes);
+    ptr->textureValue->textureBytes = newBytes;
   }
 
   if (ptr->textureSizeUniform != -1) {
@@ -1209,7 +1214,9 @@ void OpenGlRenderer::finishFrame() {
   // fraction of frames; a few frames of defrag latency is invisible.
 #ifdef STAR_SYSTEM_FAMILY_MOBILE
   static unsigned s_compressionCounter = 0;
-  bool runCompression = (++s_compressionCounter % 8) == 0;
+  float memFrac = memoryUsageCached().fraction();
+  bool underPressure = memFrac >= 0.70f;
+  bool runCompression = underPressure || (++s_compressionCounter % 8) == 0;
 #else
   bool runCompression = true;
 #endif
@@ -1218,11 +1225,17 @@ void OpenGlRenderer::finishFrame() {
     // textures from being compressed (only matters when compression runs).
     List<RenderPrimitive> empty;
     m_immediateRenderBuffer->set(empty);
-    filter(m_liveTextureGroups, [](auto const& p) {
-          unsigned const CompressionsPerFrame = 1;
+    filter(m_liveTextureGroups, [&](auto const& p) {
+          unsigned compressions = 1;
+#ifdef STAR_SYSTEM_FAMILY_MOBILE
+          if (memFrac >= 0.80f)
+            compressions = 32;
+          else if (underPressure)
+            compressions = 8;
+#endif
 
           if (!p.unique() || p->textureAtlasSet.totalTextures() > 0) {
-            p->textureAtlasSet.compressionPass(CompressionsPerFrame);
+            p->textureAtlasSet.compressionPass(compressions);
             return true;
           }
 
@@ -1239,6 +1252,12 @@ void OpenGlRenderer::finishFrame() {
 
 OpenGlRenderer::GlTextureAtlasSet::GlTextureAtlasSet(unsigned atlasNumCells)
   : TextureAtlasSet(16, atlasNumCells) {}
+
+OpenGlRenderer::GlTextureAtlasSet::~GlTextureAtlasSet() {
+  if (m_copyFbo != 0)
+    glDeleteFramebuffers(1, &m_copyFbo);
+  memoryAccountAdd(MemoryCategory::TextureAtlas, -(int64_t)m_atlasBytes);
+}
 
 GLuint OpenGlRenderer::GlTextureAtlasSet::createAtlasTexture(Vec2U const& size, PixelFormat pixelFormat) {
   GLuint glTextureId;
@@ -1263,6 +1282,14 @@ GLuint OpenGlRenderer::GlTextureAtlasSet::createAtlasTexture(Vec2U const& size, 
   }
 
   uploadTextureImage(pixelFormat, size, nullptr);
+
+  // One atlas page is tens of megabytes (4096x4096 RGBA = 64MB) and on the
+  // Switch the GL driver carves it out of the same heap as everything else,
+  // so this is the single biggest line item the RAM indicator reports.
+  unsigned bytes = size[0] * size[1] * Star::bytesPerPixel(pixelFormat);
+  m_atlasBytes += bytes;
+  memoryAccountAdd(MemoryCategory::TextureAtlas, (int64_t)bytes);
+
   return glTextureId;
 }
 
@@ -1271,6 +1298,47 @@ void OpenGlRenderer::GlTextureAtlasSet::destroyAtlasTexture(GLuint const& glText
 #ifdef STAR_SYSTEM_SWITCH
   g_glTextureDels.fetch_add(1, std::memory_order_relaxed);
 #endif
+
+  Vec2U size = atlasTextureSize();
+  unsigned bytes = size[0] * size[1] * Star::bytesPerPixel(PixelFormat::RGBA32);
+  m_atlasBytes -= bytes;
+  memoryAccountAdd(MemoryCategory::TextureAtlas, -(int64_t)bytes);
+}
+
+bool OpenGlRenderer::GlTextureAtlasSet::copyAtlasRegion(GLuint const& destTexture, Vec2U const& destBottomLeft,
+    GLuint const& sourceTexture, RectU const& sourceRegion) {
+  if (m_copyFbo == 0) {
+    glGenFramebuffers(1, &m_copyFbo);
+    if (m_copyFbo == 0)
+      return false;
+  }
+
+  // Read/draw bindings are separate so this never disturbs whatever the
+  // renderer is drawing into; only the read side is touched and restored.
+  GLint previousReadFbo = 0;
+  glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previousReadFbo);
+
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, m_copyFbo);
+  glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sourceTexture, 0);
+
+  bool ok = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+  if (ok) {
+    // Drain anything an earlier call left queued: the check below must report
+    // on this copy alone, or one unrelated error disables compaction for good.
+    while (glGetError() != GL_NO_ERROR) {}
+    glBindTexture(GL_TEXTURE_2D, destTexture);
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, destBottomLeft[0], destBottomLeft[1],
+        sourceRegion.xMin(), sourceRegion.yMin(), sourceRegion.width(), sourceRegion.height());
+    ok = glGetError() == GL_NO_ERROR;
+  }
+
+  glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, previousReadFbo);
+
+  if (!ok)
+    Logger::warn("Atlas compaction disabled: this GL driver cannot copy atlas-to-atlas");
+
+  return ok;
 }
 
 void OpenGlRenderer::GlTextureAtlasSet::copyAtlasPixels(
@@ -1370,6 +1438,7 @@ OpenGlRenderer::GlLoneTexture::~GlLoneTexture() {
 #ifdef STAR_SYSTEM_SWITCH
     g_glTextureDels.fetch_add(1, std::memory_order_relaxed);
 #endif
+  memoryAccountAdd(MemoryCategory::TextureAtlas, -(int64_t)textureBytes);
 }
 
 Vec2U OpenGlRenderer::GlLoneTexture::size() const {
@@ -1775,8 +1844,11 @@ auto OpenGlRenderer::createGlTexture(ImageView const& image, TextureAddressing a
   setTextureFiltering(glLoneTexture->textureFiltering);
 
 
-  if (!image.empty())
+  if (!image.empty()) {
     uploadTextureImage(image.format, image.size, image.data);
+    glLoneTexture->textureBytes = (size_t)image.size[0] * image.size[1] * Star::bytesPerPixel(image.format);
+    memoryAccountAdd(MemoryCategory::TextureAtlas, (int64_t)glLoneTexture->textureBytes);
+  }
 
   return glLoneTexture;
 }

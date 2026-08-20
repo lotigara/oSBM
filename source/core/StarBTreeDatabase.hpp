@@ -86,6 +86,11 @@ public:
   uint32_t leafBlockCount();
 
   void commit();
+
+  // Bytes of pending block writes held in memory since the last commit. Every
+  // touched block is buffered whole until then, so on a busy world this is a
+  // large and unbounded consumer between syncs.
+  size_t uncommittedBytes() const;
   void rollback();
 
   void close(bool closeDevice = false);
@@ -296,6 +301,9 @@ private:
 
   // Temporarily holds written data so that it can be rolled back.
   mutable Map<BlockIndex, ByteArray> m_uncommittedWrites;
+  // Bytes parked in m_uncommittedWrites. Tracked incrementally because callers
+  // need to consult it often enough that summing the map would show up.
+  mutable size_t m_uncommittedWriteBytes = 0;
 };
 
 // Version of BTreeDatabase that hashes keys with SHA-256 to produce a unique

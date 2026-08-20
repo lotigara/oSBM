@@ -39,23 +39,34 @@ TitleScreen::TitleScreen(PlayerStoragePtr playerStorage, MixerPtr mixer, Univers
     Logger::info("Title world is {} @ CelestialWorld:{}", Text::stripEscapeCodes(*name), randomWorld);
 
   SkyParameters skyParameters(randomWorld, m_celestialDatabase);
+  Logger::info("Title: sky parameters ready");
   m_skyBackdrop = make_shared<Sky>(skyParameters, true);
+  Logger::info("Title: sky backdrop ready");
 
   m_musicTrack = make_shared<AmbientNoisesDescription>(assets->json("/interface/windowconfig/title.config:music").toObject(), "/");
 
+  Logger::info("Title: initMainMenu");
   initMainMenu();
+  Logger::info("Title: initCharSelectionMenu");
   initCharSelectionMenu();
+  Logger::info("Title: initCharCreationMenu");
   initCharCreationMenu();
+  Logger::info("Title: initMultiPlayerMenu");
   initMultiPlayerMenu();
+  Logger::info("Title: initOptionsMenu");
   initOptionsMenu(client);
+  Logger::info("Title: initModsMenu");
   initModsMenu();
+  Logger::info("Title: menus ready");
 
   resetState();
 }
 
 void TitleScreen::renderInit(RendererPtr renderer) {
+  Logger::info("Title: EnvironmentPainter renderInit");
   m_renderer = std::move(renderer);
   m_environmentPainter = make_shared<EnvironmentPainter>(m_renderer);
+  Logger::info("Title: EnvironmentPainter ready");
 }
 
 void TitleScreen::render() {

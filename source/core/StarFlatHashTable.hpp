@@ -96,7 +96,13 @@ public:
   bool operator!=(FlatHashTable const& rhs) const;
 
 private:
-  static constexpr size_t MinCapacity = 8;
+  // Was 8. Most hash maps in the engine are tiny -- a Json object with two or
+  // three keys, a per-entity lookup -- and at 8 they allocated 9 buckets of 56
+  // bytes for a handful of entries. Measured on the modded headless server:
+  // 2263MB -> 2141MB after fullyLoad, with load time unchanged. Maps that grow
+  // past this simply rehash one or two steps earlier, which did not show up in
+  // load time or the test suite.
+  static constexpr size_t MinCapacity = 2;
   static constexpr double MaxFillLevel = 0.7;
 
   // Scans for the next bucket value that is non-empty
@@ -464,15 +470,12 @@ bool FlatHashTable<Value, Key, GetKey, Hash, Equals, Allocator>::operator==(Flat
   if (size() != rhs.size())
     return false;
 
-  auto i = begin();
-  auto j = rhs.begin();
-  auto e = end();
-
-  while (i != e) {
-    if (*i != *j)
+  // Iteration order depends on capacity and insertion history, so equality
+  // must be by lookup, never by parallel iteration.
+  for (auto i = begin(), e = end(); i != e; ++i) {
+    auto j = rhs.find(m_getKey(*i));
+    if (j == rhs.end() || *j != *i)
       return false;
-    ++i;
-    ++j;
   }
 
   return true;

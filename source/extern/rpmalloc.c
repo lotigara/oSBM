@@ -75,6 +75,50 @@
 #define rpmalloc_assume(cond) 0
 #endif
 
+// oSBM: fixed-budget device tuning. --------------------------------------
+// rpmalloc's stock cache limits assume a machine that can spare memory for
+// allocation speed. On Switch the whole process gets ~3.2GB shared with the GL
+// driver, and the stock limits allow a *multi-gigabyte* global span cache
+// (GLOBAL_CACHE_MULTIPLIER 8 x up to 100 large-span slots, across 63 size
+// classes, of 64KB spans). Measured on hardware: freeing 421MB of assets
+// returned 0MB to the system, and the process died at 95% of its pool.
+//
+// These caps bound the hoard at the source rather than relying on
+// rpmalloc_release_caches() to mop it up afterwards. They trade some
+// allocation throughput for headroom, which is the right trade when running
+// out of memory is fatal. MAX_THREAD_SPAN_LARGE_CACHE must stay above
+// LARGE_CLASS_COUNT/2 (=31) or the large-span cache limit goes negative, and
+// THREAD_SPAN_CACHE_TRANSFER must stay <= MAX_THREAD_SPAN_CACHE.
+//
+// A byte-based override of the large-span cache limit was tried here and
+// REVERTED: measured on hardware it did not reduce memory at all (the hoard was
+// never the problem -- allocCached stayed at 64-110MB while the process grew by
+// 2GB), and lowering the limit narrows the margin on the unsigned underflow in
+// _rpmalloc_global_cache_insert_spans. Not worth the risk for no benefit.
+#if defined(STAR_ALLOC_PROFILE)
+// Defined in StarAllocProfile.cpp. Declared by hand because this is C and the
+// profiler's header is C++.
+extern void starAllocProfileTrackC(void* pointer, size_t size, void* returnAddress);
+extern void starAllocProfileUntrackC(void* pointer);
+#endif
+
+//
+// MAX_THREAD_SPAN_CACHE was 128. Hardware measurement of `cacheMB` showed
+// 151MB parked in per-thread span caches after returning to the ship -- memory
+// that is FREE but that rpmalloc_release_caches() cannot reach, because it can
+// only drain the calling thread's heap plus the global cache. Capping the
+// per-thread cache pushes those spans out to the global cache, which the
+// release path does drain.
+//
+// MAX_THREAD_SPAN_LARGE_CACHE must stay above LARGE_CLASS_COUNT/2 (=32) or the
+// large-span limit goes negative, so it can only come down slightly.
+#if defined(__SWITCH__) || defined(STAR_SYSTEM_ANDROID)
+#define MAX_THREAD_SPAN_CACHE        32
+#define THREAD_SPAN_CACHE_TRANSFER    8
+#define MAX_THREAD_SPAN_LARGE_CACHE  34
+#define GLOBAL_CACHE_MULTIPLIER       1
+#endif
+
 #ifndef HEAP_ARRAY_SIZE
 //! Size of heap hashmap
 #define HEAP_ARRAY_SIZE           47
@@ -214,6 +258,8 @@ static DWORD fls_key;
 //  newlib heap instead (see _rpmalloc_mmap_os / _rpmalloc_unmap_os).
 #  include <malloc.h>
 #  include <stdio.h>
+#  include <fcntl.h>
+#  include <unistd.h>
 #  ifndef MAP_FAILED
 #    define MAP_FAILED ((void*)(intptr_t)-1)
 #  endif
@@ -320,6 +366,18 @@ static FORCEINLINE void    atomic_store_ptr_release(atomicptr_t* dst, void* val)
 static FORCEINLINE void*   atomic_exchange_ptr_acquire(atomicptr_t* dst, void* val) { return atomic_exchange_explicit(dst, val, memory_order_acquire); }
 static FORCEINLINE int     atomic_cas_ptr(atomicptr_t* dst, void* val, void* ref) { return atomic_compare_exchange_weak_explicit(dst, &ref, val, memory_order_relaxed, memory_order_relaxed); }
 
+// Bytes rpmalloc currently holds from the system heap. mallinfo() cannot
+// separate rpmalloc's spans from allocations made directly against newlib (the
+// mesa/nouveau GL driver, libnx), and that difference decides whether a memory
+// problem belongs to the engine or to the driver underneath it.
+static atomic64_t _star_mapped_bytes;
+
+size_t
+rpmalloc_mapped_bytes(void) {
+	int64_t v = atomic_load64(&_star_mapped_bytes);
+	return v > 0 ? (size_t)v : 0;
+}
+
 #define EXPECTED(x) __builtin_expect((x), 1)
 #define UNEXPECTED(x) __builtin_expect((x), 0)
 
@@ -389,13 +447,24 @@ static FORCEINLINE int     atomic_cas_ptr(atomicptr_t* dst, void* val, void* ref
 //! Size of a span header (must be a multiple of SMALL_GRANULARITY and a power of two)
 #define SPAN_HEADER_SIZE          128
 //! Number of spans in thread cache
+#ifndef MAX_THREAD_SPAN_CACHE
 #define MAX_THREAD_SPAN_CACHE     400
+#endif
 //! Number of spans to transfer between thread and global cache
+#ifndef THREAD_SPAN_CACHE_TRANSFER
 #define THREAD_SPAN_CACHE_TRANSFER 64
+#endif
 //! Number of spans in thread cache for large spans (must be greater than LARGE_CLASS_COUNT / 2)
+#ifndef MAX_THREAD_SPAN_LARGE_CACHE
 #define MAX_THREAD_SPAN_LARGE_CACHE 100
+#endif
 //! Number of spans to transfer between thread and global cache for large spans
 #define THREAD_SPAN_LARGE_CACHE_TRANSFER 6
+//! Per-class limit for the large-span thread cache. Stock rpmalloc bounds this
+//  by span count; fixed-budget targets override it with a byte-based bound.
+#ifndef THREAD_SPAN_LARGE_CACHE_LIMIT
+#define THREAD_SPAN_LARGE_CACHE_LIMIT(span_count) (MAX_THREAD_SPAN_LARGE_CACHE - ((span_count) >> 1))
+#endif
 
 _Static_assert((SMALL_GRANULARITY & (SMALL_GRANULARITY - 1)) == 0, "Small granularity must be power of two");
 _Static_assert((SPAN_HEADER_SIZE & (SPAN_HEADER_SIZE - 1)) == 0, "Span header size must be power of two");
@@ -969,15 +1038,43 @@ _rpmalloc_mmap_os(size_t size, size_t* offset) {
 	//  size makes the generic padding logic below a no-op adjustment.
 	size_t align = (_memory_span_size > _memory_page_size) ? _memory_span_size : _memory_page_size;
 	void* ptr = memalign(align, size + padding);
+	if (ptr)
+		atomic_add64(&_star_mapped_bytes, (int64_t)(size + padding));
+	if (!ptr) {
+		//  Before giving up, hand every cached free span back to newlib and try
+		//  once more. Observed on hardware: a 4MB span-aligned request failed
+		//  while 104MB was free -- the heap was fragmented, not exhausted, and
+		//  rpmalloc was itself sitting on the spans that would have coalesced
+		//  it. Safe to call here: mmap is never invoked while a span-cache lock
+		//  is held, and releasing only unmaps spans that are already free.
+		extern size_t rpmalloc_release_caches(void);
+		if (rpmalloc_release_caches())
+			ptr = memalign(align, size + padding);
+			if (ptr)
+				atomic_add64(&_star_mapped_bytes, (int64_t)(size + padding));
+	}
 	if (!ptr) {
 		//  Loud failure: distinguishing heap exhaustion from other faults is
 		//  critical when the whole engine runs on this allocator.
+		//
+		//  svcOutputDebugString alone is invisible on real hardware, so this
+		//  also lands in crash.txt -- an out-of-memory here is the last thing
+		//  that happens before the process dies and it must not be silent.
 		extern void svcOutputDebugString(const char* str, unsigned long size);
-		char dbg[128];
+		char dbg[160];
 		struct mallinfo mi = mallinfo();
 		int len = snprintf(dbg, sizeof(dbg), "rpmalloc: span map FAILED size=%zu arena=%zu used=%zu free=%zu",
 			size + padding, (size_t)mi.arena, (size_t)mi.uordblks, (size_t)mi.fordblks);
-		if (len > 0) svcOutputDebugString(dbg, (unsigned long)len);
+		if (len > 0) {
+			svcOutputDebugString(dbg, (unsigned long)len);
+			int fd = open("/switch/oSBM/crash.txt", O_WRONLY | O_CREAT | O_APPEND, 0644);
+			if (fd >= 0) {
+				write(fd, dbg, (size_t)len);
+				write(fd, "\n", 1);
+				fsync(fd);
+				close(fd);
+			}
+		}
 	}
 #  else
 	int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_UNINITIALIZED;
@@ -1055,8 +1152,10 @@ _rpmalloc_unmap_os(void* address, size_t size, size_t offset, size_t release) {
 		rpmalloc_assert(0, "Failed to unmap virtual memory block");
 	}
 #elif defined(__SWITCH__)
-	if (release)
+	if (release) {
+		atomic_add64(&_star_mapped_bytes, -(int64_t)release);
 		free(address);
+	}
 	//  Decommit (release == 0) is a no-op: the span stays resident in the
 	//  newlib heap and is reused by rpmalloc's span cache.
 #else
@@ -1224,6 +1323,17 @@ _rpmalloc_span_map_aligned_count(heap_t* heap, size_t span_count) {
 	size_t aligned_span_count = _rpmalloc_span_align_count(span_count);
 	size_t align_offset = 0;
 	span_t* span = (span_t*)_rpmalloc_mmap(aligned_span_count * _memory_span_size, &align_offset);
+	if (!span && (aligned_span_count > span_count)) {
+		// Fragmentation fallback. The mapping granularity is 64 spans (4MB), and
+		// on a fixed-budget device that request fails long before memory is
+		// actually gone -- observed on Switch failing at 4MB with 111MB free,
+		// which then aborted the process. Nothing here needs the extra spans, so
+		// drop to exactly what was asked for rather than giving up. reserved_count
+		// becomes 0 below, so the global-reserve path this skips is not needed.
+		aligned_span_count = span_count;
+		align_offset = 0;
+		span = (span_t*)_rpmalloc_mmap(aligned_span_count * _memory_span_size, &align_offset);
+	}
 	if (!span)
 		return 0;
 	_rpmalloc_span_initialize(span, aligned_span_count, span_count, align_offset);
@@ -1497,7 +1607,7 @@ static void
 _rpmalloc_global_cache_insert_spans(span_t** span, size_t span_count, size_t count) {
 	const size_t cache_limit = (span_count == 1) ?
 		GLOBAL_CACHE_MULTIPLIER * MAX_THREAD_SPAN_CACHE :
-		GLOBAL_CACHE_MULTIPLIER * (MAX_THREAD_SPAN_LARGE_CACHE - (span_count >> 1));
+		GLOBAL_CACHE_MULTIPLIER * THREAD_SPAN_LARGE_CACHE_LIMIT(span_count);
 
 	global_cache_t* cache = &_memory_span_cache[span_count - 1];
 
@@ -1508,8 +1618,12 @@ _rpmalloc_global_cache_insert_spans(span_t** span, size_t span_count, size_t cou
 #if ENABLE_STATISTICS
 	cache->insert_count += count;
 #endif
+	// Clamp rather than subtract blindly: if count has somehow reached or passed
+	// the limit, cache_limit - cache->count underflows size_t and the memcpy
+	// below writes far past the array. Cheap guard against a catastrophic and
+	// very hard to diagnose heap corruption.
 	if ((cache->count + insert_count) > cache_limit)
-		insert_count = cache_limit - cache->count;
+		insert_count = (cache_limit > cache->count) ? (cache_limit - cache->count) : 0;
 
 	memcpy(cache->span + cache->count, span, sizeof(span_t*) * insert_count);
 	cache->count += (uint32_t)insert_count;
@@ -1760,7 +1874,7 @@ _rpmalloc_heap_cache_insert(heap_t* heap, span_t* span) {
 		size_t cache_idx = span_count - 2;
 		span_large_cache_t* span_cache = heap->span_large_cache + cache_idx;
 		span_cache->span[span_cache->count++] = span;
-		const size_t cache_limit = (MAX_THREAD_SPAN_LARGE_CACHE - (span_count >> 1));
+		const size_t cache_limit = THREAD_SPAN_LARGE_CACHE_LIMIT(span_count);
 		if (span_cache->count == cache_limit) {
 			const size_t transfer_limit = 2 + (cache_limit >> 2);
 			const size_t transfer_count = (THREAD_SPAN_LARGE_CACHE_TRANSFER <= transfer_limit ? THREAD_SPAN_LARGE_CACHE_TRANSFER : transfer_limit);
@@ -2066,7 +2180,12 @@ _rpmalloc_heap_release(void* heapptr, int first_class, int release_cache) {
 			if (!span_cache->count)
 				continue;
 #if ENABLE_GLOBAL_CACHE
-			if (heap->finalize) {
+			if (heap->finalize || first_class) {
+				// First-class (per-world) heaps: unmap empty cached spans
+				// instead of dumping them into the global cache. The global
+				// cache cannot be drained while other threads allocate, so
+				// inserting here was why returning to the ship never shrank
+				// the process.
 				for (size_t ispan = 0; ispan < span_cache->count; ++ispan)
 					_rpmalloc_span_unmap(span_cache->span[ispan]);
 			} else {
@@ -2092,8 +2211,15 @@ _rpmalloc_heap_release(void* heapptr, int first_class, int release_cache) {
 #endif
 
 	// If we are forcibly terminating with _exit the state of the
-	// lock atomic is unknown and it's best to just go ahead and exit
-	if (get_thread_id() != _rpmalloc_main_thread_id) {
+	// lock atomic is unknown and it's best to just go ahead and exit.
+	// That escape hatch is only safe for the process-exit path though: oSBM
+	// releases per-world first-class heaps from the MAIN thread mid-run
+	// (WorldClient is destroyed on the client thread during a warp), racing
+	// _rpmalloc_heap_allocate on other threads over the orphan list. An
+	// unlocked push there can hand the same heap to two worlds at once, whose
+	// unsynchronized allocations then corrupt the heap. First-class releases
+	// therefore always take the lock.
+	if (first_class || get_thread_id() != _rpmalloc_main_thread_id) {
 		while (!atomic_cas32_acquire(&_memory_global_lock, 1, 0))
 			_rpmalloc_spin();
 	}
@@ -2314,10 +2440,28 @@ _rpmalloc_allocate_huge(heap_t* heap, size_t size) {
 	return pointer_offset(span, SPAN_HEADER_SIZE);
 }
 
+static void*
+_rpmalloc_allocate_impl(heap_t* heap, size_t size);
+
 //! Allocate a block of the given size
 static void*
 _rpmalloc_allocate(heap_t* heap, size_t size) {
 	_rpmalloc_stat_add64(&_allocation_counter, 1);
+#if defined(STAR_ALLOC_PROFILE)
+	// Sampled attribution for every allocation, including raw malloc from C
+	// (GL driver, libnx, zlib, freetype, Lua) which operator new never sees.
+	// The hook takes no locks and never allocates, so calling it from inside
+	// the allocator is safe.
+	void* star_profile_ptr = _rpmalloc_allocate_impl(heap, size);
+	starAllocProfileTrackC(star_profile_ptr, size, __builtin_return_address(0));
+	return star_profile_ptr;
+#else
+	return _rpmalloc_allocate_impl(heap, size);
+#endif
+}
+
+static void*
+_rpmalloc_allocate_impl(heap_t* heap, size_t size) {
 	if (EXPECTED(size <= SMALL_SIZE_LIMIT))
 		return _rpmalloc_allocate_small(heap, size);
 	else if (size <= _memory_medium_size_limit)
@@ -2441,6 +2585,14 @@ retry:
 	++heap->full_span_count;
 
 	_rpmalloc_stat_add64(&_allocation_counter, 1);
+
+#if defined(STAR_ALLOC_PROFILE)
+	// This path maps its pages directly instead of going through
+	// _rpmalloc_allocate, so without this hook large-alignment allocations are
+	// invisible to the profiler while still counting towards the process size.
+	// Exactly what a GPU driver uses for buffers and textures.
+	starAllocProfileTrackC(ptr, size, __builtin_return_address(0));
+#endif
 
 	return ptr;
 }
@@ -2619,6 +2771,9 @@ _rpmalloc_deallocate_huge(span_t* span) {
 static void
 _rpmalloc_deallocate(void* p) {
 	_rpmalloc_stat_add64(&_deallocation_counter, 1);
+#if defined(STAR_ALLOC_PROFILE)
+	starAllocProfileUntrackC(p);
+#endif
 	//Grab the span (always at start of span, using span alignment)
 	span_t* span = (span_t*)((uintptr_t)p & _memory_span_mask);
 	if (UNEXPECTED(!span))
@@ -3236,6 +3391,192 @@ rpmalloc_usable_size(void* ptr) {
 
 extern inline void
 rpmalloc_thread_collect(void) {
+}
+
+#if ENABLE_STATISTICS
+//! Per-size-class occupancy across every heap: live bytes against the bytes of
+//  span actually held for that class. rpmalloc can only return a span when all
+//  of its blocks are free, so a class at low occupancy is pinning many times
+//  its own live data. Writes "class=blocksize:liveMB/spanMB" for the worst
+//  offenders. Read-only apart from the atomics rpmalloc already maintains.
+void
+rpmalloc_occupancy_report(char* buffer, size_t buffer_size) {
+	if (!buffer || !buffer_size)
+		return;
+	buffer[0] = 0;
+	size_t live_total = 0, span_total = 0;
+	size_t used = 0;
+	struct { size_t live, spans, block; } cls[SIZE_CLASS_COUNT];
+	memset(cls, 0, sizeof(cls));
+
+	for (size_t list_idx = 0; list_idx < HEAP_ARRAY_SIZE; ++list_idx) {
+		heap_t* heap = _memory_heaps[list_idx];
+		while (heap) {
+			for (size_t iclass = 0; iclass < SIZE_CLASS_COUNT; ++iclass) {
+				size_t live = (size_t)atomic_load32(&heap->size_class_use[iclass].alloc_current);
+				size_t spans = (size_t)atomic_load32(&heap->size_class_use[iclass].spans_current);
+				cls[iclass].live += live * _memory_size_class[iclass].block_size;
+				cls[iclass].spans += spans * _memory_span_size;
+				cls[iclass].block = _memory_size_class[iclass].block_size;
+			}
+			heap = heap->next_heap;
+		}
+	}
+	for (size_t iclass = 0; iclass < SIZE_CLASS_COUNT; ++iclass) {
+		live_total += cls[iclass].live;
+		span_total += cls[iclass].spans;
+	}
+	// Large spans (span_count > 1) carry allocations above the medium limit and
+	// are NOT part of size_class_use, so without them the accounting misses
+	// exactly the biggest allocations -- images, tile sectors, big hash tables.
+	size_t large_span_bytes = 0, huge_bytes = 0;
+	for (size_t list_idx = 0; list_idx < HEAP_ARRAY_SIZE; ++list_idx) {
+		heap_t* heap = _memory_heaps[list_idx];
+		while (heap) {
+			for (size_t iclass = 1; iclass < LARGE_CLASS_COUNT; ++iclass) {
+				size_t spans = (size_t)atomic_load32(&heap->span_use[iclass].current);
+				large_span_bytes += spans * (iclass + 1) * _memory_span_size;
+			}
+			huge_bytes += (size_t)heap->full_span_count * _memory_span_size;
+			heap = heap->next_heap;
+		}
+	}
+
+	// Bytes parked in the per-thread span caches. Large spans freed by the
+	// engine land here rather than being unmapped, and the stock limit is by
+	// span COUNT, so a class holding 64-span blocks can park 32MB in one class
+	// of one thread. This is the number that says whether the large-span
+	// footprint is live data or cache.
+	size_t cache_bytes = 0;
+	for (size_t list_idx = 0; list_idx < HEAP_ARRAY_SIZE; ++list_idx) {
+		heap_t* heap = _memory_heaps[list_idx];
+		while (heap) {
+			for (size_t iclass = 0; iclass < LARGE_CLASS_COUNT; ++iclass) {
+				span_cache_t* sc = iclass ? (span_cache_t*)(heap->span_large_cache + (iclass - 1)) : &heap->span_cache;
+				cache_bytes += (size_t)sc->count * (iclass + 1) * _memory_span_size;
+			}
+			heap = heap->next_heap;
+		}
+	}
+
+	// The GLOBAL span cache and the reserve are mapped memory owned by no heap,
+	// so the per-heap walk above cannot see them. On hardware they were the bulk
+	// of a 551MB gap between rpmapped and everything this report could account
+	// for.
+	size_t global_cache_bytes = 0;
+	for (size_t iclass = 0; iclass < LARGE_CLASS_COUNT; ++iclass) {
+		global_cache_t* gc = &_memory_span_cache[iclass];
+		global_cache_bytes += (size_t)gc->count * (iclass + 1) * _memory_span_size;
+		for (span_t* sp = gc->overflow; sp; sp = sp->next)
+			global_cache_bytes += (size_t)sp->span_count * _memory_span_size;
+	}
+	size_t reserved_bytes = (size_t)_memory_global_reserve_count * _memory_span_size;
+	for (size_t list_idx = 0; list_idx < HEAP_ARRAY_SIZE; ++list_idx) {
+		heap_t* heap = _memory_heaps[list_idx];
+		while (heap) {
+			reserved_bytes += (size_t)heap->spans_reserved * _memory_span_size;
+			heap = heap->next_heap;
+		}
+	}
+
+	// Huge allocations (over the large limit) are mapped as raw page runs and
+	// belong to none of the size classes above, so without this the accounting
+	// silently misses them -- on hardware that was ~700MB unexplained.
+	size_t huge_pages = (size_t)atomic_load32(&_huge_pages_current) * _memory_page_size;
+
+	int written = snprintf(buffer, buffer_size,
+		" liveMB=%zu spanMB=%zu largeMB=%zu fullMB=%zu cacheMB=%zu hugeMB=%zu gcacheMB=%zu resvMB=%zu",
+		live_total >> 20, span_total >> 20, large_span_bytes >> 20, huge_bytes >> 20, cache_bytes >> 20,
+		huge_pages >> 20, global_cache_bytes >> 20, reserved_bytes >> 20);
+	if (written > 0)
+		used = (size_t)written;
+
+	// The five classes wasting the most, i.e. largest (span - live).
+	for (int rank = 0; rank < 5; ++rank) {
+		size_t best = 0, best_idx = SIZE_CLASS_COUNT;
+		for (size_t iclass = 0; iclass < SIZE_CLASS_COUNT; ++iclass) {
+			if (cls[iclass].spans <= cls[iclass].live)
+				continue;
+			size_t waste = cls[iclass].spans - cls[iclass].live;
+			if (waste > best) { best = waste; best_idx = iclass; }
+		}
+		if (best_idx == SIZE_CLASS_COUNT)
+			break;
+		written = snprintf(buffer + used, buffer_size - used, " b%zu=%zu/%zuMB",
+			cls[best_idx].block, cls[best_idx].live >> 20, cls[best_idx].spans >> 20);
+		if (written <= 0 || (size_t)written >= buffer_size - used)
+			break;
+		used += (size_t)written;
+		cls[best_idx].spans = cls[best_idx].live; // exclude from next rank
+	}
+}
+#endif
+
+//! Release cached free spans back to the OS. See rpmalloc.h for why this
+//  exists; unlike _rpmalloc_heap_release(release_cache=1) this UNMAPS the
+//  thread cache instead of pushing it into the global cache, because the goal
+//  is to give memory back rather than move it between rpmalloc's own caches.
+size_t
+rpmalloc_release_thread_caches(void) {
+	size_t released = 0;
+
+	heap_t* heap = get_thread_heap_raw();
+	if (heap) {
+		_rpmalloc_heap_cache_adopt_deferred(heap, 0);
+#if ENABLE_THREAD_CACHE
+		for (size_t iclass = 0; iclass < LARGE_CLASS_COUNT; ++iclass) {
+			span_cache_t* span_cache;
+			if (!iclass)
+				span_cache = &heap->span_cache;
+			else
+				span_cache = (span_cache_t*)(heap->span_large_cache + (iclass - 1));
+			for (size_t ispan = 0; ispan < span_cache->count; ++ispan) {
+				released += (iclass + 1) * _memory_span_size;
+				_rpmalloc_span_unmap(span_cache->span[ispan]);
+			}
+			span_cache->count = 0;
+		}
+#endif
+	}
+	return released;
+}
+
+//! Release cached free spans back to the OS. See rpmalloc.h for why this
+//  exists; unlike _rpmalloc_heap_release(release_cache=1) this UNMAPS the
+//  thread cache instead of pushing it into the global cache, because the goal
+//  is to give memory back rather than move it between rpmalloc's own caches.
+size_t
+rpmalloc_release_caches(void) {
+	size_t released = rpmalloc_release_thread_caches();
+
+#if ENABLE_GLOBAL_CACHE
+	for (size_t iclass = 0; iclass < LARGE_CLASS_COUNT; ++iclass) {
+		global_cache_t* cache = &_memory_span_cache[iclass];
+		while (!atomic_cas32_acquire(&cache->lock, 1, 0))
+			_rpmalloc_spin();
+
+		for (size_t ispan = 0; ispan < cache->count; ++ispan) {
+			released += (iclass + 1) * _memory_span_size;
+			_rpmalloc_span_unmap(cache->span[ispan]);
+		}
+		cache->count = 0;
+
+		// The overflow list is unbounded, so it must be drained too or the
+		// bulk of a large hoard can survive this call.
+		span_t* span = cache->overflow;
+		cache->overflow = 0;
+		while (span) {
+			span_t* next = span->next;
+			released += (iclass + 1) * _memory_span_size;
+			_rpmalloc_span_unmap(span);
+			span = next;
+		}
+
+		atomic_store32_release(&cache->lock, 0);
+	}
+#endif
+
+	return released;
 }
 
 void

@@ -206,7 +206,9 @@ private:
 
   NetElementGroup m_netGroup;
   StatCollection m_statCollection;
-  NetElementOverride<NetElementHashMap<String, Json>> m_statusProperties;
+  // JsonObject: status properties are a Json object and are reset from and
+  // stored as one.
+  NetElementOverride<NetElementMapWrapper<JsonObject>> m_statusProperties;
   NetElementData<DirectivesGroup> m_parentDirectives;
   NetElementBool m_toolUsageSuppressed;
 

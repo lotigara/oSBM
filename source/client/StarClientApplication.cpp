@@ -1,9 +1,14 @@
 #include "StarClientApplication.hpp"
+#include "StarWorldServer.hpp"
 #include "StarConfiguration.hpp"
 #include "StarJsonExtra.hpp"
 #include "StarFile.hpp"
 #include "StarEncode.hpp"
 #include "StarLogging.hpp"
+#include "StarAllocProfile.hpp"
+#include "StarDiagnostics.hpp"
+#include "StarMemoryUsage.hpp"
+#include "scripting/StarLuaRoot.hpp"
 #include "StarJsonExtra.hpp"
 #include "StarRoot.hpp"
 #include "StarVersion.hpp"
@@ -534,6 +539,27 @@ void ClientApplication::windowChanged(WindowMode windowMode, Vec2U screenSize) {
 }
 
 void ClientApplication::processInput(InputEvent const& event) {
+#ifdef STAR_PLATFORM_MOBILE
+  // A human just took the controls, so stop driving. The autopilot exists to
+  // exercise the game unattended; if it keeps warping on its schedule while
+  // someone is playing it yanks them out of whatever they are doing, which
+  // looks exactly like the game refusing to warp. Observed doing precisely
+  // that during a hardware test session.
+  //
+  // Deliberately only real input events -- the autopilot itself never
+  // synthesises any, so this cannot disable itself.
+  // "sticky" in the autopilot spec keeps it driving through stray input --
+  // used for unattended soak tests on a desktop where a focus click would
+  // otherwise cancel the run.
+  if (m_autopilotActive && !m_autopilotSticky
+      && (event.is<KeyDownEvent>() || event.is<MouseButtonDownEvent>()
+          || event.is<ControllerButtonDownEvent>())) {
+    m_autopilotActive = false;
+    Logger::info("[autopilot] real input detected, handing control back to the player");
+    diagnosticsNoteStep("autopilot yielded to player input");
+  }
+#endif
+
   if (auto keyDown = event.ptr<KeyDownEvent>()) {
     m_heldKeyEvents.append(*keyDown);
     m_edgeKeyEvents.append(*keyDown);
@@ -600,6 +626,14 @@ void ClientApplication::processInput(InputEvent const& event) {
 void ClientApplication::update() {
   float dt = GlobalTimestep * GlobalTimescale;
   auto& app = appController();
+#ifdef STAR_SYSTEM_SWITCH
+  static unsigned s_reloadPoll = 0;
+  if ((++s_reloadPoll % 45) == 0 && File::isFile("/switch/oSBM/reload.flag")) {
+    Logger::info("reload.flag present, chainloading this NRO");
+    try { File::remove("/switch/oSBM/reload.flag"); } catch (std::exception const&) {}
+    switchPlatformRelaunchAndExit();
+  }
+#endif
   if (m_state >= MainAppState::Title) {
     if (auto p2pNetworkingService = app->p2pNetworkingService()) {
       if (auto join = p2pNetworkingService->pullPendingJoin()) {
@@ -701,6 +735,9 @@ void ClientApplication::render() {
     };
 #endif
     WorldClientPtr worldClient = m_universeClient->worldClient();
+    // Previous frame's WorldStop left GPU textures in-flight through
+    // finishFrame; drop them here, before this frame's paint.
+    flushGpuAfterWorldLeave();
     if (worldClient) {
 #if !STAR_SYSTEM_ANDROID && !STAR_SYSTEM_IOS
       auto totalStart = Time::monotonicMicroseconds();
@@ -885,12 +922,39 @@ void ClientApplication::render() {
       // newlib heap view: covers BOTH rpmalloc span growth (engine) and direct
       // newlib users (the mesa/nouveau GL driver) -- deltas locate slow leaks.
       struct mallinfo mi = mallinfo();
-      Logger::info("[perf-mem] newlibUsed={}kB newlibFree={}kB arena={}kB",
+      // This is the only place the (expensive, free-list-walking) mallinfo is
+      // paid for, on a fixed frame cadence -- publish it so the low-memory
+      // reclaim and the RAM indicator can read a live figure without paying it
+      // themselves. See memoryUsageReportProcessBytes().
+      memoryUsageReportProcessBytes((uint64_t)(unsigned)mi.uordblks);
+      // Name the world in the heartbeat: when an unattended run dies, knowing
+      // it was in an instance dungeon rather than on a planet is most of the
+      // diagnosis.
+      diagnosticsSetActivity(strf("fps={:.0f} world={}", 1e6 * s_frames / std::max<int64_t>(s_frameUs, 1),
+          printWorldId(m_universeClient->playerWorld())));
+      // Process-wide, not just the client's engine: the world servers and
+      // scripting threads each run their own and were never counted.
+      memoryAccountSet(MemoryCategory::Lua, LuaEngine::totalMemoryUsage());
+      Logger::info("[perf-mem] newlibUsed={}kB newlibFree={}kB arena={}kB assetCache={}kB textures={}kB lua={}kB rpmapped={}kB worlds={}/{}",
           (uint64_t)(unsigned)mi.uordblks >> 10, (uint64_t)(unsigned)mi.fordblks >> 10,
-          (uint64_t)(unsigned)mi.arena >> 10);
+          (uint64_t)(unsigned)mi.arena >> 10,
+          memoryAccountBytes(MemoryCategory::AssetCache) >> 10,
+          memoryAccountBytes(MemoryCategory::TextureAtlas) >> 10,
+          memoryAccountBytes(MemoryCategory::Lua) >> 10,
+          memoryAllocatorMappedBytes() >> 10,
+          worldServerLiveCount().load(std::memory_order_relaxed),
+          worldClientLiveCount().load(std::memory_order_relaxed));
       char atBuf[512];
       starAllocTrackReport(atBuf, sizeof(atBuf));
       Logger::info("[perf-alloc]{}", (char const*)atBuf);
+#ifdef STAR_ALLOC_PROFILE
+      // Offsets are relative to allocProfileBaseAddress(); resolve with
+      // addr2line against dist/starbound.elf after adding the file address of
+      // Star::allocProfileBaseAddress.
+      char apBuf[512];
+      allocProfileReport(apBuf, sizeof(apBuf));
+      Logger::info("[perf-allocprof]{}", (char const*)apBuf);
+#endif
     }
 #endif
 #if !STAR_SYSTEM_ANDROID && !STAR_SYSTEM_IOS
@@ -1530,12 +1594,17 @@ void ClientApplication::updateTitle(float dt) {
       s_autopilotFlagCached = contents ? 1 : 0;
       if (contents) {
         m_autopilotStayOnShip = contents->contains("stay");
+        m_autopilotSticky = contents->contains("sticky");
         for (auto const& line : contents->split('\n')) {
           auto trimmed = line.trim();
           if (trimmed.beginsWith("warp="))
             m_autopilotWarpTarget = trimmed.substr(5).trim();
           if (trimmed.beginsWith("open="))
             m_autopilotOpenPane = trimmed.substr(5).trim();
+          if (trimmed.beginsWith("scenario="))
+            m_autopilotScenario = trimmed.substr(9).trim().split(',');
+          if (trimmed.beginsWith("cycle="))
+            m_autopilotCycleSeconds = std::max(10.0f, maybeLexicalCast<float>(trimmed.substr(6).trim()).value(45.0f));
         }
       }
     }
@@ -1631,9 +1700,48 @@ void ClientApplication::updateRunning(float dt) {
       if (m_mainInterface && (nowSecs - s_lastAutoBeam > 60.0)
           && m_universeClient->playerWorld().is<ClientShipWorldId>()
           && !m_universeClient->flying() && m_universeClient->clientContext()->orbitWarpAction()
-          && m_autopilotActive && !m_autopilotStayOnShip && m_autopilotWarpTarget.empty()) {
+          && m_autopilotActive && !m_autopilotStayOnShip && m_autopilotWarpTarget.empty()
+          && m_autopilotCycleSeconds <= 0.0f) {
         s_lastAutoBeam = nowSecs;
         m_universeClient->warpPlayer(WarpAlias::OrbitedWorld, true, "beam");
+      }
+
+      // Autopilot world cycling: warp ship <-> planet on a fixed period so a
+      // soak actually exercises world load and teardown. Runs instead of the
+      // one-shot beam above once armed.
+      if (m_autopilotActive && m_autopilotCycleSeconds > 0.0f && m_mainInterface
+          && m_player && m_player->inWorld() && !m_universeClient->flying()) {
+        static double s_lastCycle = 0;
+        if (s_lastCycle == 0)
+          s_lastCycle = nowSecs;
+        else if (nowSecs - s_lastCycle > m_autopilotCycleSeconds) {
+          s_lastCycle = nowSecs;
+          try {
+            if (m_autopilotScenario.empty()) {
+              bool onShip = m_universeClient->playerWorld().is<ClientShipWorldId>();
+              m_universeClient->warpPlayer(
+                  onShip ? WarpAlias::OrbitedWorld : WarpAlias::OwnShip, true, "beam");
+              Logger::info("[autopilot] cycle warp to {}", onShip ? "planet" : "ship");
+            } else {
+              // Always return to the ship between destinations: warping
+              // straight between two instance worlds is not something a player
+              // can do, and the point is to reproduce real usage.
+              bool onShip = m_universeClient->playerWorld().is<ClientShipWorldId>();
+              String target;
+              if (onShip) {
+                target = m_autopilotScenario.at(m_autopilotScenarioIndex % m_autopilotScenario.size());
+                ++m_autopilotScenarioIndex;
+              } else {
+                target = "ownship";
+              }
+              diagnosticsNoteStep(strf("warp {} (step {})", target, m_autopilotScenarioIndex));
+              m_universeClient->warpPlayer(parseWarpAction(target), true, "beam");
+              Logger::info("[autopilot] scenario warp to {}", target);
+            }
+          } catch (std::exception const& e) {
+            Logger::error("[autopilot] cycle warp failed: {}", e.what());
+          }
+        }
       }
 
       // Autopilot warp target: one-shot warp to an arbitrary destination
@@ -1959,6 +2067,7 @@ void ClientApplication::updateRunning(float dt) {
     // applied promptly, and this is a safe main-thread point (no frame in
     // flight, sim not running).
     m_universeClient->flushDeferredWorldPackets();
+    flushGpuAfterWorldLeave();
     // Overlapped sim pipeline: instead of running the (~20-25ms) sim tick
     // here, defer it so render() can run it on the sim worker thread
     // CONCURRENTLY with world painting (pure GL from immutable renderData
@@ -1986,6 +2095,7 @@ void ClientApplication::updateRunning(float dt) {
     m_universeClient->update(dt);
 #endif
 #endif
+    flushGpuAfterWorldLeave();
     if (checkDisconnection())
       return;
 
@@ -2214,6 +2324,15 @@ void ClientApplication::runSwitchKeyboardSession(PaneManager* paneManager, bool 
     widget->blur();
 }
 #endif
+
+void ClientApplication::flushGpuAfterWorldLeave() {
+  auto worldClient = m_universeClient ? m_universeClient->worldClient() : WorldClientPtr();
+  if (!worldClient || !worldClient->pullWorldCleared())
+    return;
+  if (m_worldPainter)
+    m_worldPainter->cleanup(0);
+  Logger::info("ClientApplication: flushed world GPU caches after world leave");
+}
 
 void ClientApplication::updateCamera(float dt) {
   if (!m_universeClient->worldClient()) {

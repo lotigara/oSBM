@@ -1,4 +1,5 @@
 #include "StarUniverseServer.hpp"
+#include "StarMemoryUsage.hpp"
 #include "StarAiDatabase.hpp"
 #include "StarAssets.hpp"
 #include "StarBiomeDatabase.hpp"
@@ -1311,13 +1312,14 @@ void UniverseServer::shutdownInactiveWorlds() {
               Logger::warn("UniverseServer: Resetting stored ship chunks for {} after ship world error", worldId);
               m_clients.get(*clientId)->updateShipChunks({});
             } else {
-              world->unloadAll(true);
-              m_clients.get(*clientId)->updateShipChunks(world->readChunks());
+              m_clients.get(*clientId)->updateShipChunks(world->takeFinalChunks());
             }
           }
         }
 
         m_worlds.remove(worldId);
+        // Leave allocator-cache unmap to the maintenance sweep: the arriving
+        // world may already be allocating on another thread.
         // Once a world is shutdown, mark its shutdown time in m_tempWorldIndex
         if (auto instanceWorldId = worldId.maybe<InstanceWorldId>()) {
           if (m_tempWorldIndex.contains(*instanceWorldId))
@@ -2164,6 +2166,26 @@ Maybe<ConnectionId> UniverseServer::getClientForUuid(Uuid const& uuid) const {
   return {};
 }
 
+namespace {
+  // A world that failed to initialise is very often a memory failure rather
+  // than a content problem: generating a dungeon needs a large transient burst,
+  // and on a fixed-budget console that is the first thing to fail. Measured on
+  // Switch, warping to the outpost at 93% of the pool threw bad_alloc out of
+  // dungeon generation and bounced the player back to their ship.
+  //
+  // Hand the allocator's cached spans back before the player retries, so the
+  // retry has the memory the first attempt lacked instead of failing the same
+  // way. Harmless when the failure was not memory-related.
+  void releaseMemoryAfterWorldCreateFailure(std::exception const& e) {
+    // Do not unmap rpmalloc spans here: world threads are still allocating
+    // (the player just bounced back to the ship). Drain interned JSON and
+    // the asset cache only.
+    if (Root* root = Root::singletonPtr())
+      root->reclaimAfterWorldUnload();
+    (void)e;
+  }
+}
+
 WorldServerThreadPtr UniverseServer::getWorld(WorldId const& worldId) {
   if (m_worlds.contains(worldId)) {
     auto& maybeWorldPromise = m_worlds.get(worldId);
@@ -2175,6 +2197,7 @@ WorldServerThreadPtr UniverseServer::getWorld(WorldId const& worldId) {
     } catch (std::exception const& e) {
       maybeWorldPromise.reset();
       Logger::error("UniverseServer: error during world create: {}", outputException(e, true));
+      releaseMemoryAfterWorldCreateFailure(e);
       worldDiedWithError(worldId, strf("{}", outputException(e, false)));
     }
   }
@@ -2198,6 +2221,7 @@ WorldServerThreadPtr UniverseServer::createWorld(WorldId const& worldId) {
   } catch (std::exception const& e) {
     maybeWorldPromise.reset();
     Logger::error("UniverseServer: error during world create: {}", outputException(e, true));
+    releaseMemoryAfterWorldCreateFailure(e);
     worldDiedWithError(worldId, strf("{}", outputException(e, false)));
     return {};
   }
@@ -2226,6 +2250,7 @@ Maybe<WorldServerThreadPtr> UniverseServer::triggerWorldCreation(WorldId const& 
     } catch (std::exception const& e) {
       maybeWorldPromise.reset();
       Logger::error("UniverseServer: error during world create: {}", outputException(e, true));
+      releaseMemoryAfterWorldCreateFailure(e);
       worldDiedWithError(worldId, strf("{}", outputException(e, false)));
       return WorldServerThreadPtr();
     }
@@ -2554,9 +2579,20 @@ void UniverseServer::worldDiedWithError(WorldId world, String const& errorDetail
       if (attempts < 1) {
         m_shipWorldRecoveryAttempts[*clientId] = attempts + 1;
         Logger::warn("UniverseServer: Ship world {} errored for client {} ({}), attempting automatic ship reset", world, *clientId, errorDetail);
-        if (auto clientContext = m_clients.value(*clientId))
-          clientContext->updateShipChunks({});
-        return;
+        // The recovery itself allocates, and this handler is reached precisely
+        // when memory has run out -- so it is the likeliest place in the engine
+        // for a bad_alloc to be thrown while already handling one. Escaping here
+        // reaches std::terminate and takes the process down with no crash log,
+        // observed on hardware as "terminate: uncaught exception: std::bad_alloc"
+        // immediately after this line. Falling through to a disconnect is a far
+        // better outcome than dying.
+        try {
+          if (auto clientContext = m_clients.value(*clientId))
+            clientContext->updateShipChunks({});
+          return;
+        } catch (std::exception const& e) {
+          Logger::error("UniverseServer: Ship reset for client {} failed ({}), disconnecting instead", *clientId, outputException(e, false));
+        }
       }
 
       m_pendingDisconnections.add(*clientId, strf("Client ship world has errored after automatic recovery: {}", errorDetail));

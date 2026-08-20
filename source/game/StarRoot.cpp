@@ -40,6 +40,7 @@
 #include "StarDirectoryAssetSource.hpp"
 #include "StarPackedAssetSource.hpp"
 #include "StarJsonBuilder.hpp"
+#include "StarJsonIntern.hpp"
 #include "StarQuestTemplateDatabase.hpp"
 #include "StarAiDatabase.hpp"
 #include "StarTechDatabase.hpp"
@@ -52,6 +53,12 @@
 #include "StarSpawnTypeDatabase.hpp"
 #include "StarRadioMessageDatabase.hpp"
 #include "StarCollectionDatabase.hpp"
+#include "StarAllocProfile.hpp"
+#if defined(STAR_USE_RPMALLOC)
+#include "rpmalloc.h"
+#endif
+#include "StarDiagnostics.hpp"
+#include "StarMemoryUsage.hpp"
 
 #include <sstream>
 #ifdef STAR_SYSTEM_SWITCH
@@ -99,8 +106,32 @@ namespace {
     } catch (...) {}
 #endif
 
-    return "memory status unavailable";
+    return memoryUsageSummary();
   }
+
+  // Fraction of the platform's memory ceiling past which the maintenance
+  // thread stops waiting for TTLs and drops every asset nothing else is
+  // holding. This is the difference between a reload hitch and an allocation
+  // failure that takes the process down, so it fires well before the wall.
+  float const LowMemoryReclaimFraction = 0.88f;
+
+  // Past this the process is close enough to death that nothing is worth
+  // protecting: purge on every sweep regardless of the interval below.
+  float const CriticalMemoryFraction = 0.93f;
+
+  // Minimum seconds between ASSET CACHE purges. Purging costs a reload of
+  // everything still in use (SD-card reads on Switch), so doing it on every 5s
+  // sweep trades a memory problem for a stutter problem.
+  //
+  // Deliberately NOT applied to the allocator-cache release: that one is cheap
+  // and is the only thing that actually returns memory to the system. An
+  // earlier version rate-limited both together, and on hardware that blocked
+  // the second reclaim during the 25 seconds in which the process ran from 91%
+  // to a fatal 95%.
+  double const AssetPurgeInterval = 30.0;
+
+  // Total handed back by the per-sweep release, for the maintenance log.
+  uint64_t s_idleReleasedMB = 0;
 }
 
 Root* Root::singletonPtr() {
@@ -152,36 +183,74 @@ Root::Root(Settings settings) : RootBase() {
   m_maintenanceThread = Thread::invoke("Root::maintenanceMain", [this]() {
       MutexLocker locker(m_maintenanceStopMutex);
       while (!m_stopMaintenanceThread) {
+        // Every sweep below takes the lock its subsystem's readers need, so a
+        // slow one stalls the render and sim threads -- exactly the shape of a
+        // "the game freezes for a moment every few seconds" report. Timed so
+        // that stall is attributable instead of showing up as unexplained
+        // frame time.
+        double maintenanceStart = Time::monotonicTime();
+        double phaseStart = maintenanceStart;
+        double objectMs = 0, itemMs = 0, monsterMs = 0, assetsMs = 0, tenantMs = 0, imgMetaMs = 0, configMs = 0;
+        auto lapPhase = [&phaseStart](double& out) {
+          double now = Time::monotonicTime();
+          out = (now - phaseStart) * 1000.0;
+          phaseStart = now;
+        };
+
         m_reloadListeners.clearExpiredListeners();
 
-        {
+        if (!m_fullyLoading.load()) {
           MutexLocker locker(m_objectDatabaseMutex);
           if (ObjectDatabasePtr objectDb = m_objectDatabase) {
             locker.unlock();
             objectDb->cleanup();
           }
         }
-        {
+        lapPhase(objectMs);
+        if (!m_fullyLoading.load()) {
           MutexLocker locker(m_itemDatabaseMutex);
           if (ItemDatabasePtr itemDb = m_itemDatabase) {
             locker.unlock();
             itemDb->cleanup();
           }
         }
-        {
+        lapPhase(itemMs);
+        if (!m_fullyLoading.load()) {
           MutexLocker locker(m_monsterDatabaseMutex);
           if (MonsterDatabasePtr monsterDb = m_monsterDatabase) {
             locker.unlock();
             monsterDb->cleanup();
           }
         }
-        {
+        lapPhase(monsterMs);
+        if (!m_fullyLoading.load()) {
           MutexLocker locker(m_assetsMutex);
           if (AssetsPtr assets = m_assets) {
             locker.unlock();
             assets->cleanup();
+
+            static double s_lastAssetPurge = 0;
+            double nowSeconds = Time::monotonicTime();
+            auto usage = memoryUsage();
+            float fraction = usage.budget != 0 ? usage.fraction() : 0.0f;
+
+            if (fraction >= LowMemoryReclaimFraction) {
+              bool critical = fraction >= CriticalMemoryFraction;
+              if (critical || nowSeconds - s_lastAssetPurge >= AssetPurgeInterval) {
+                s_lastAssetPurge = nowSeconds;
+                assets->clearCache();
+                // The Json intern table holds a reference to every distinct
+                // value it has seen, so it must not be allowed to grow without
+                // bound. Dropping it does not undo the deduplication -- values
+                // that were merged stay merged, because they are shared.
+                jsonInternClear();
+                Logger::warn("Root: low memory ({}{}), purged asset cache",
+                    memoryUsageSummary(), critical ? ", CRITICAL" : "");
+              }
+            }
           }
         }
+        lapPhase(assetsMs);
         {
           MutexLocker locker(m_tenantDatabaseMutex);
           if (TenantDatabasePtr tenantDb = m_tenantDatabase) {
@@ -189,6 +258,7 @@ Root::Root(Settings settings) : RootBase() {
             tenantDb->cleanup();
           }
         }
+        lapPhase(tenantMs);
         {
           MutexLocker locker(m_imageMetadataDatabaseMutex);
           if (ImageMetadataDatabasePtr imgMetaDb = m_imageMetadataDatabase) {
@@ -196,12 +266,58 @@ Root::Root(Settings settings) : RootBase() {
             imgMetaDb->cleanup();
           }
         }
+        lapPhase(imgMetaMs);
 
         Random::addEntropy();
 
         {
           MutexLocker locker(m_configurationMutex);
           writeConfig();
+        }
+        lapPhase(configMs);
+
+        // Logged unconditionally (one line per 5s sweep): a threshold only
+        // ever showed the tail, which made it impossible to tell a fix that
+        // lowered the whole distribution from one that got a lucky sample.
+        // Crash-survivable run state, written after the sweep so it carries
+        // fresh memory numbers. Inert unless a heartbeat path was configured.
+        diagnosticsWriteHeartbeat();
+
+#ifdef STAR_ALLOC_PROFILE
+        // Emitted here rather than from the client render loop so it also
+        // works headless -- the dedicated server loads the same databases and
+        // worlds, which is the cheapest way to attribute engine memory without
+        // a device in the loop.
+        {
+          char profileBuffer[512];
+          allocProfileReport(profileBuffer, sizeof(profileBuffer));
+          // The split first: it says whether the memory belongs to the engine
+          // (C++) or to something underneath it (the GL driver, libnx, zlib,
+          // freetype, Lua), which decides where to look next.
+          Logger::info("[perf-allocsplit] cxx={}MB malloc={}MB",
+              allocProfileCxxBytes() / (1024 * 1024), allocProfileMallocBytes() / (1024 * 1024));
+          Logger::info("[perf-allocprof]{}", (char const*)profileBuffer);
+
+        }
+#endif
+
+#if defined(STAR_USE_RPMALLOC) && ENABLE_STATISTICS
+        {
+          // Live bytes against span bytes held, per size class. Says whether the
+          // memory a departed world left behind is still referenced or is
+          // stranded in spans that cannot be returned.
+          char occupancyBuffer[512];
+          rpmalloc_occupancy_report(occupancyBuffer, sizeof(occupancyBuffer));
+          Logger::info("[perf-occupancy]{}", (char const*)occupancyBuffer);
+        }
+#endif
+
+        double maintenanceMs = (Time::monotonicTime() - maintenanceStart) * 1000.0;
+        {
+          Logger::info("[perf-maint] sweep {:.1f}ms obj={:.1f} item={:.1f} mon={:.1f} assets={:.1f} tenant={:.1f} imgmeta={:.1f} config={:.1f} ({}) jsonintern={} hit={} miss={}",
+              maintenanceMs, objectMs, itemMs, monsterMs, assetsMs, tenantMs, imgMetaMs, configMs, memoryUsageSummary(),
+              jsonInternSize(), jsonInternHits(), jsonInternMisses());
+        Logger::info("[perf-reclaim] idleReleasedMB={}", s_idleReleasedMB);
         }
 
         m_maintenanceStopCondition.wait(m_maintenanceStopMutex, RootMaintenanceSleep);
@@ -379,6 +495,7 @@ void Root::loadMods(StringList modDirectories, bool _reload) {
 void Root::fullyLoad() {
   Logger::info("Root: Loading everything with {} worker thread(s)", RootLoadThreads);
   Logger::info("Root: Memory before fullyLoad: {}", processMemorySummary());
+  m_fullyLoading.store(true);
   auto workerPool = WorkerPool("Root::fullyLoad", RootLoadThreads);
   List<WorkerPoolHandle> loaders;
 
@@ -436,7 +553,30 @@ void Root::fullyLoad() {
     if (m_assets)
       m_assets->clearCache();
   }
+  jsonInternClear();
+  // Unmap while maintenance still skips Assets::cleanup (m_fullyLoading).
+  // Clearing the flag first let the maintenance thread walk the cache
+  // while this thread unmapped those spans -- instruction abort to NULL
+  // inside Assets::cleanup().
+  if (uint64_t released = memoryReleaseAllocatorCaches())
+    Logger::info("Root: released {}MB of allocator cache after fullyLoad", released / (1024 * 1024));
   Logger::info("Root: Memory after asset cache clear: {}", processMemorySummary());
+  m_fullyLoading.store(false);
+}
+
+void Root::reclaimAfterWorldUnload() {
+  {
+    MutexLocker locker(m_assetsMutex);
+    if (m_assets)
+      m_assets->clearCache();
+  }
+  jsonInternClear();
+  // Only this thread's empty span cache. The global cache cannot be drained
+  // while world threads allocate -- that race was the data abort in
+  // _rpmalloc_deallocate_huge / Assets::cleanup.
+  if (uint64_t released = memoryReleaseThreadCaches())
+    Logger::info("Root: released {}MB of thread allocator cache after world unload",
+        released / (1024 * 1024));
 }
 
 void Root::registerReloadListener(ListenerWeakPtr reloadListener) {
@@ -840,9 +980,9 @@ shared_ptr<T> Root::loadMemberFunction(shared_ptr<T>& ptr, Mutex& mutex, char co
       throw;
     }
     Logger::info("Root: Loaded {} in {} seconds", name, Time::monotonicTime() - startSeconds);
-#if STAR_SYSTEM_FAMILY_MOBILE
+    // Not gated to mobile: the per-database delta is how you decide which
+    // databases are worth deferring, and that is measured on the desktop server.
     Logger::info("Root: Memory after {}: {}", name, processMemorySummary());
-#endif
   }
   return ptr;
 }

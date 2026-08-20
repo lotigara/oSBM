@@ -1,4 +1,5 @@
 #include "StarJsonBuilder.hpp"
+#include "StarJsonIntern.hpp"
 #include "StarLexicalCast.hpp"
 
 namespace Star {
@@ -15,7 +16,7 @@ void JsonBuilderStream::endObject() {
   JsonObject object;
   while (true) {
     if (isSentry()) {
-      set(Json(std::move(object)));
+      set(jsonIntern(Json(std::move(object))));
       return;
     } else {
       Json v = pop();
@@ -35,7 +36,7 @@ void JsonBuilderStream::endArray() {
   while (true) {
     if (isSentry()) {
       array.reverse();
-      set(Json(std::move(array)));
+      set(jsonIntern(Json(std::move(array))));
       return;
     } else {
       array.append(pop());
@@ -44,7 +45,11 @@ void JsonBuilderStream::endArray() {
 }
 
 void JsonBuilderStream::putString(char32_t const* s, size_t len) {
-  push(Json(s, len));
+  // String values repeat heavily across assets (paths, categories, race and
+  // rarity names). Keys are deliberately not interned: they are converted to a
+  // String and copied into the map, so a canonical Json around them would be
+  // thrown away immediately.
+  push(jsonIntern(Json(s, len)));
 }
 
 void JsonBuilderStream::putDouble(char32_t const* s, size_t len) {

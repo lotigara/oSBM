@@ -17,7 +17,7 @@ public:
   StagehandPtr createStagehand(String const& stagehandType, Json const& extraConfig = Json()) const;
 
 private:
-  StringMap<Json> m_stagehandTypes;
+  JsonObject m_stagehandTypes;
 };
 
 }

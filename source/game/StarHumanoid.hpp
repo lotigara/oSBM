@@ -506,7 +506,10 @@ private:
   void setupNetElements();
 
   Json m_config;
-  NetElementHashMap<String,Json> m_humanoidParameters;
+  // Wraps JsonObject directly rather than a separate HashMap<String,Json>: the
+  // two are no longer the same type now that Json objects are stored sorted,
+  // and every use of this member converts to or from a JsonObject anyway.
+  NetElementMapWrapper<JsonObject> m_humanoidParameters;
   HumanoidPtr m_humanoid;
 };
 

@@ -47,6 +47,10 @@ public:
   // chunks.
   void cleanup();
 
+  // Drops every cached chunk and tile texture immediately. World change has
+  // no use for the previous world's tiles.
+  void flush();
+
 private:
   typedef uint64_t QuadZLevel;
   typedef uint64_t ChunkHash;

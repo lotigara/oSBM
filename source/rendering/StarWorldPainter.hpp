@@ -29,6 +29,12 @@ public:
   void render(WorldRenderData& renderData, function<bool()> lightWaiter);
   void adjustLighting(WorldRenderData& renderData);
 
+  // Frees textures unused for longer than textureTimeout. 0 drops every
+  // texture not drawn this millisecond -- used after leaving a world so the
+  // previous world's sprites do not occupy atlas pages until the vanilla 30s
+  // TTL.
+  void cleanup(int64_t textureTimeout);
+
 private:
   void renderParticles(WorldRenderData& renderData, Particle::Layer layer);
   void renderBars(WorldRenderData& renderData);

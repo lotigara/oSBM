@@ -615,6 +615,16 @@ void LuaEngine::setAutoGarbageCollection(bool autoGarbageColleciton) {
 }
 
 void LuaEngine::tuneAutoGarbageCollection(float pause, float stepMultiplier) {
+#ifdef STAR_SYSTEM_FAMILY_MOBILE
+  // The stock pause lets a Lua state grow to that multiple of its size at the
+  // last collection before collecting again -- on the vanilla world and client
+  // configs that means roughly doubling. The engine runs a Lua state per world
+  // and per scripting thread, and hardware profiling found ~1,000,000 live Lua
+  // allocations, so that headroom is multiplied many times over on a device
+  // with a fixed budget. Collect sooner and do more work per step instead.
+  pause = std::min(pause, 1.15f);
+  stepMultiplier = std::max(stepMultiplier, 2.0f);
+#endif
   lua_gc(m_state, LUA_GCSETPAUSE, round(pause * 100));
   lua_gc(m_state, LUA_GCSETSTEPMUL, round(stepMultiplier * 100));
 }
@@ -711,13 +721,35 @@ void LuaEngine::countHook(lua_State* state, lua_Debug* ar) {
   }
 }
 
+// Every Lua state in the process allocates through here, which makes it the
+// only place that can answer how much Lua is really using. LuaEngine::
+// memoryUsage() reports one state's GC count, and the engine runs many of them
+// (the client, every world server, each scripting thread, ItemDatabase), so the
+// figure the RAM indicator used to show was a small fraction of the truth --
+// measured on hardware at ~20MB reported against 76-168MB actually live.
+std::atomic<int64_t> LuaEngine::s_totalAllocatedBytes{0};
+
 void* LuaEngine::allocate(void*, void* ptr, size_t oldSize, size_t newSize) {
   if (newSize == 0) {
+    if (ptr)
+      s_totalAllocatedBytes.fetch_sub((int64_t)oldSize, std::memory_order_relaxed);
     Star::free(ptr, oldSize);
     return nullptr;
   } else {
-    return Star::realloc(ptr, newSize);
+    void* result = Star::realloc(ptr, newSize);
+    if (result) {
+      // ptr is null for a fresh allocation, in which case oldSize is not a
+      // previous size and must not be subtracted.
+      int64_t previous = ptr ? (int64_t)oldSize : 0;
+      s_totalAllocatedBytes.fetch_add((int64_t)newSize - previous, std::memory_order_relaxed);
+    }
+    return result;
   }
+}
+
+size_t LuaEngine::totalMemoryUsage() {
+  int64_t v = s_totalAllocatedBytes.load(std::memory_order_relaxed);
+  return v > 0 ? (size_t)v : 0;
 }
 
 void LuaEngine::handleError(lua_State* state, int res) {

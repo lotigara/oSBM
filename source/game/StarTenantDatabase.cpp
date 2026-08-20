@@ -13,6 +13,8 @@ bool Tenant::criteriaSatisfied(StringMap<unsigned> const& colonyTags) const {
 }
 
 TenantDatabase::TenantDatabase() {
+  // Not size-bounded, for the same reason as ObjectDatabase: TenantPtr is
+  // shared and the key space (tenant names) is finite.
   auto assets = Root::singleton().assets();
 
   auto& files = assets->scanExtension("tenant");

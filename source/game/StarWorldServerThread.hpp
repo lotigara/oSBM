@@ -79,6 +79,10 @@ public:
   // into memory, useful for the ship.
   WorldChunks readChunks();
 
+  // Ship snapshot taken on the world thread during teardown, before the
+  // WorldServer is destroyed. Empty when the world was not a ship, or errored.
+  WorldChunks takeFinalChunks();
+
 protected:
   virtual void run();
 
@@ -93,6 +97,7 @@ private:
   HashSet<ConnectionId> m_clients;
 
   WorldServerPtr m_worldServer;
+  WorldChunks m_finalChunks;
   WorldId m_worldId;
   WorldServerAction m_updateAction;
 
