@@ -282,6 +282,7 @@ void* operator new[](std::size_t size, std::nothrow_t const&) noexcept {
 }
 
 void operator delete(void* ptr) noexcept {
+  Star::allocProfileUntrack(ptr);
   rpfree(ptr);
 }
 

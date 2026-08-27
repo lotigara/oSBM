@@ -115,8 +115,8 @@ extern void starAllocProfileUntrackC(void* pointer);
 #if defined(__SWITCH__)
 // newlib cannot decommit rpmalloc subspans. With the stock 64-span (4MB)
 // mapping, one surviving allocation pins the whole group; repeated outpost
-// warps retained ~400MB per cycle. Map spans independently and do not move
-// empty spans into another cache so each one can return to newlib immediately.
+// warps retained ~400MB per cycle. The Switch mapping pool below makes
+// one-span mappings cheap while allowing every released span to be reused.
 #define DEFAULT_SPAN_MAP_COUNT      1
 #define ENABLE_GLOBAL_CACHE         0
 #endif
@@ -374,7 +374,7 @@ static FORCEINLINE void    atomic_store_ptr_release(atomicptr_t* dst, void* val)
 static FORCEINLINE void*   atomic_exchange_ptr_acquire(atomicptr_t* dst, void* val) { return atomic_exchange_explicit(dst, val, memory_order_acquire); }
 static FORCEINLINE int     atomic_cas_ptr(atomicptr_t* dst, void* val, void* ref) { return atomic_compare_exchange_weak_explicit(dst, &ref, val, memory_order_relaxed, memory_order_relaxed); }
 
-// Bytes rpmalloc currently holds from the system heap. mallinfo() cannot
+// Bytes rpmalloc reserves from the system heap. mallinfo() cannot
 // separate rpmalloc's spans from allocations made directly against newlib (the
 // mesa/nouveau GL driver, libnx), and that difference decides whether a memory
 // problem belongs to the engine or to the driver underneath it.
@@ -952,6 +952,100 @@ _rpmalloc_spin(void) {
 #endif
 }
 
+#if defined(__SWITCH__)
+// newlib cannot provide virtual mappings, and repeatedly returning thousands
+// of span-aligned blocks fragments its heap. Keep rpmalloc's backing separate
+// and coalesce released mappings for reuse across worlds.
+typedef struct star_switch_map_block_t {
+	size_t size;
+	struct star_switch_map_block_t* next;
+} star_switch_map_block_t;
+
+static atomic32_t _star_switch_map_lock;
+static star_switch_map_block_t* _star_switch_map_free;
+
+#define STAR_SWITCH_MAP_CHUNK_SIZE (16 * 1024 * 1024)
+
+static void
+_star_switch_map_insert(void* address, size_t size) {
+	star_switch_map_block_t* block = (star_switch_map_block_t*)address;
+	star_switch_map_block_t* previous = 0;
+	star_switch_map_block_t* current = _star_switch_map_free;
+	uintptr_t block_address = (uintptr_t)block;
+
+	while (current && ((uintptr_t)current < block_address)) {
+		previous = current;
+		current = current->next;
+	}
+
+	block->size = size;
+	block->next = current;
+	if (previous)
+		previous->next = block;
+	else
+		_star_switch_map_free = block;
+
+	if (previous && (((uintptr_t)previous + previous->size) == block_address)) {
+		previous->size += block->size;
+		previous->next = block->next;
+		block = previous;
+	}
+	if (block->next && (((uintptr_t)block + block->size) == (uintptr_t)block->next)) {
+		block->size += block->next->size;
+		block->next = block->next->next;
+	}
+}
+
+static void*
+_star_switch_map_allocate(size_t size) {
+	size_t align = (_memory_span_size > _memory_page_size) ? _memory_span_size : _memory_page_size;
+	if (size > (SIZE_MAX - (align - 1)))
+		return 0;
+	size_t rounded_size = (size + align - 1) & ~(align - 1);
+
+	while (!atomic_cas32_acquire(&_star_switch_map_lock, 1, 0))
+		_rpmalloc_spin();
+
+	star_switch_map_block_t* previous = 0;
+	star_switch_map_block_t* block = _star_switch_map_free;
+	while (block && (block->size < rounded_size)) {
+		previous = block;
+		block = block->next;
+	}
+
+	if (!block) {
+		size_t backing_size = rounded_size > STAR_SWITCH_MAP_CHUNK_SIZE ? rounded_size : STAR_SWITCH_MAP_CHUNK_SIZE;
+		block = (star_switch_map_block_t*)memalign(align, backing_size);
+		if (!block) {
+			atomic_store32_release(&_star_switch_map_lock, 0);
+			return 0;
+		}
+		block->size = backing_size;
+		block->next = 0;
+		atomic_add64(&_star_mapped_bytes, (int64_t)backing_size);
+	} else if (previous) {
+		previous->next = block->next;
+	} else {
+		_star_switch_map_free = block->next;
+	}
+
+	if (block->size > rounded_size)
+		_star_switch_map_insert(pointer_offset(block, rounded_size), block->size - rounded_size);
+	atomic_store32_release(&_star_switch_map_lock, 0);
+	return block;
+}
+
+static void
+_star_switch_map_release(void* address, size_t size) {
+	size_t align = (_memory_span_size > _memory_page_size) ? _memory_span_size : _memory_page_size;
+	size = (size + align - 1) & ~(align - 1);
+	while (!atomic_cas32_acquire(&_star_switch_map_lock, 1, 0))
+		_rpmalloc_spin();
+	_star_switch_map_insert(address, size);
+	atomic_store32_release(&_star_switch_map_lock, 0);
+}
+#endif
+
 #if defined(_WIN32) && (!defined(BUILD_DYNAMIC_LINK) || !BUILD_DYNAMIC_LINK)
 static void NTAPI
 _rpmalloc_thread_destructor(void* value) {
@@ -1048,25 +1142,13 @@ _rpmalloc_mmap_os(size_t size, size_t* offset) {
 	}
 #else
 #  if defined(__SWITCH__)
-	//  Span-aligned allocation from the newlib heap.  Alignment to the span
-	//  size makes the generic padding logic below a no-op adjustment.
-	size_t align = (_memory_span_size > _memory_page_size) ? _memory_span_size : _memory_page_size;
-	void* ptr = memalign(align, size + padding);
-	if (ptr)
-		atomic_add64(&_star_mapped_bytes, (int64_t)(size + padding));
+	void* ptr = _star_switch_map_allocate(size + padding);
 	if (!ptr) {
-		//  Before giving up, hand every cached free span back to newlib and try
-		//  once more. Observed on hardware: a 4MB span-aligned request failed
-		//  while 104MB was free -- the heap was fragmented, not exhausted, and
-		//  rpmalloc was itself sitting on the spans that would have coalesced
-		//  it. Safe to call here: mmap is never invoked while a span-cache lock
-		//  is held, and releasing only unmaps spans that are already free.
+		// Cached mappings return directly to the pool, so one retry can satisfy
+		// this request without growing its newlib backing.
 		extern size_t rpmalloc_release_caches(void);
-		if (rpmalloc_release_caches()) {
-			ptr = memalign(align, size + padding);
-			if (ptr)
-				atomic_add64(&_star_mapped_bytes, (int64_t)(size + padding));
-		}
+		if (rpmalloc_release_caches())
+			ptr = _star_switch_map_allocate(size + padding);
 	}
 	if (!ptr) {
 		//  Loud failure: distinguishing heap exhaustion from other faults is
@@ -1167,12 +1249,10 @@ _rpmalloc_unmap_os(void* address, size_t size, size_t offset, size_t release) {
 		rpmalloc_assert(0, "Failed to unmap virtual memory block");
 	}
 #elif defined(__SWITCH__)
-	if (release) {
-		atomic_add64(&_star_mapped_bytes, -(int64_t)release);
-		free(address);
-	}
+	if (release)
+		_star_switch_map_release(address, release);
 	//  Decommit (release == 0) is a no-op: the span stays resident in the
-	//  newlib heap and is reused by rpmalloc's span cache.
+	//  rpmalloc mapping and is reused by its span cache.
 #else
 	if (release) {
 		if (munmap(address, release)) {

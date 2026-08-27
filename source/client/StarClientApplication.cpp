@@ -1805,13 +1805,20 @@ void ClientApplication::updateRunning(float dt) {
         }
       }
 
+      // Do not let a skippable mission intro turn an unattended gameplay
+      // soak into a static cinematic soak.
+      if (m_autopilotActive && m_player && m_player->inWorld()
+          && m_cinematicOverlay->suppressInput()) {
+        m_cinematicOverlay->stop();
+        Logger::info("[autopilot] skipped cinematic");
+      }
+
       // Autopilot walk: exercise REAL gameplay load (camera scroll, tile
       // chunk rebuilds, lighting recalculation, sector loads, humanoid
-      // animation) instead of an idle stare.  Walk one direction for a
-      // while, hop occasionally, then turn around; net drift stays bounded
-      // around the beam-down point.
+      // animation) instead of an idle stare. This also drives story missions
+      // far enough to activate their scripted encounters and enemies.
       if (m_autopilotActive && m_player && m_player->inWorld()
-          && m_universeClient->playerWorld().is<CelestialWorldId>()) {
+          && !m_universeClient->playerWorld().is<ClientShipWorldId>()) {
         static uint64_t s_walkTick = 0;
         ++s_walkTick;
         // Live A/B lever: drop autopilot-stand.flag on the sd card to halt the

@@ -1,5 +1,4 @@
 #include "StarDungeonGenerator.hpp"
-#include "StarThread.hpp"
 #include "StarCasting.hpp"
 #include "StarRandom.hpp"
 #include "StarLogging.hpp"
@@ -1334,6 +1333,13 @@ JsonObject DungeonDefinitions::getMetadata(String const& name) const {
   return definition->metadata();
 }
 
+size_t DungeonDefinitions::clearCache() const {
+  MutexLocker locker(m_cacheMutex);
+  size_t count = m_definitionCache.currentSize();
+  m_definitionCache.clear();
+  return count;
+}
+
 DungeonDefinitionPtr DungeonDefinitions::readDefinition(String const& path) {
   try {
     auto assets = Root::singleton().assets();
@@ -1363,58 +1369,11 @@ DungeonDefinition::DungeonDefinition(JsonObject const& definition, String const&
       return make_shared<const Dungeon::ImageTileset>(tileset);
     });
 
-  JsonArray partsDefArray = definition.get("parts").toArray();
-  size_t partCount = partsDefArray.size();
-
-  // Each part's construction (PNG decode + connector/anchor scan) is
-  // independent of every other part, so for dungeons with enough parts to be
-  // worth the thread overhead, farm them out across threads and only touch
-  // the shared m_parts map (and do the duplicate-name check) back on this
-  // thread once every worker has finished.
-  unsigned threadCount = min<unsigned>(Thread::numberOfProcessors(), (unsigned)partCount / 4);
-  if (threadCount <= 1) {
-    for (auto const& partsDefMap : partsDefArray) {
-      Dungeon::PartConstPtr part = parsePart(this, partsDefMap, tileset);
-      if (m_parts.contains(part->name()))
-        throw DungeonException::format("Duplicate dungeon part name: {}", part->name());
-      m_parts.insert(part->name(), part);
-    }
-  } else {
-    size_t chunkSize = (partCount + threadCount - 1) / threadCount;
-    List<ThreadFunction<List<Dungeon::PartConstPtr>>> workers;
-    for (unsigned t = 0; t < threadCount; ++t) {
-      size_t begin = t * chunkSize;
-      size_t end = std::min(begin + chunkSize, partCount);
-      if (begin >= end)
-        break;
-      workers.append(Thread::invoke("DungeonDefinition::parsePart", [this, &partsDefArray, tileset, begin, end]() -> List<Dungeon::PartConstPtr> {
-        List<Dungeon::PartConstPtr> result;
-        for (size_t i = begin; i < end; ++i)
-          result.append(parsePart(this, partsDefArray[i], tileset));
-        return result;
-      }));
-    }
-
-    List<List<Dungeon::PartConstPtr>> chunkResults;
-    std::exception_ptr firstException;
-    for (auto& worker : workers) {
-      try {
-        chunkResults.append(worker.finish());
-      } catch (...) {
-        if (!firstException)
-          firstException = std::current_exception();
-      }
-    }
-    if (firstException)
-      std::rethrow_exception(firstException);
-
-    for (auto const& chunk : chunkResults) {
-      for (auto const& part : chunk) {
-        if (m_parts.contains(part->name()))
-          throw DungeonException::format("Duplicate dungeon part name: {}", part->name());
-        m_parts.insert(part->name(), part);
-      }
-    }
+  for (auto const& partsDefMap : definition.get("parts").iterateArray()) {
+    Dungeon::PartConstPtr part = parsePart(this, partsDefMap, tileset);
+    if (m_parts.contains(part->name()))
+      throw DungeonException::format("Duplicate dungeon part name: {}", part->name());
+    m_parts.insert(part->name(), part);
   }
 
   if (m_metadata.contains("gravity"))

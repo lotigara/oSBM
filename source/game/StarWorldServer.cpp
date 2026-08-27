@@ -52,7 +52,6 @@ WorldServer::WorldServer(WorldTemplatePtr const& worldTemplate, IODevicePtr stor
   // buffers, the initial entity set -- lands in this world's heap too.
   m_memoryHeap = memoryDomainAcquireHeap();
   MemoryDomain memoryDomain(m_memoryHeap);
-  worldServerLiveCount().fetch_add(1, std::memory_order_relaxed);
   m_worldTemplate = worldTemplate;
   m_worldStorage = make_shared<WorldStorage>(m_worldTemplate->size(), storage, make_shared<WorldGenerator>(this));
   m_adjustPlayerStart = true;
@@ -64,6 +63,7 @@ WorldServer::WorldServer(WorldTemplatePtr const& worldTemplate, IODevicePtr stor
 
   init(true);
   writeMetadata();
+  worldServerLiveCount().fetch_add(1, std::memory_order_relaxed);
 }
 
 WorldServer::WorldServer(Vec2U const& size, IODevicePtr storage)
@@ -74,7 +74,6 @@ WorldServer::WorldServer(IODevicePtr const& storage) {
   // buffers, the initial entity set -- lands in this world's heap too.
   m_memoryHeap = memoryDomainAcquireHeap();
   MemoryDomain memoryDomain(m_memoryHeap);
-  worldServerLiveCount().fetch_add(1, std::memory_order_relaxed);
   m_worldStorage = make_shared<WorldStorage>(storage, make_shared<WorldGenerator>(this));
   m_tileProtectionEnabled = true;
   m_universeSettings = make_shared<UniverseSettings>();
@@ -82,6 +81,7 @@ WorldServer::WorldServer(IODevicePtr const& storage) {
 
   readMetadata();
   init(false);
+  worldServerLiveCount().fetch_add(1, std::memory_order_relaxed);
 }
 
 WorldServer::WorldServer(WorldChunks const& chunks) {
@@ -89,7 +89,6 @@ WorldServer::WorldServer(WorldChunks const& chunks) {
   // buffers, the initial entity set -- lands in this world's heap too.
   m_memoryHeap = memoryDomainAcquireHeap();
   MemoryDomain memoryDomain(m_memoryHeap);
-  worldServerLiveCount().fetch_add(1, std::memory_order_relaxed);
   m_worldStorage = make_shared<WorldStorage>(chunks, make_shared<WorldGenerator>(this));
   m_tileProtectionEnabled = true;
   m_universeSettings = make_shared<UniverseSettings>();
@@ -97,6 +96,7 @@ WorldServer::WorldServer(WorldChunks const& chunks) {
 
   readMetadata();
   init(false);
+  worldServerLiveCount().fetch_add(1, std::memory_order_relaxed);
 }
 
 WorldServer::~WorldServer() {
@@ -104,13 +104,19 @@ WorldServer::~WorldServer() {
   // Teardown frees this world's data, and doing it with the world's heap
   // current keeps any transient allocation out of the shared heaps.
   MemoryDomain memoryDomain(m_memoryHeap);
-  for (auto& p : m_scriptContexts)
-    p.second->uninit();
+  try {
+    for (auto& p : m_scriptContexts)
+      p.second->uninit();
 
-  m_scriptContexts.clear();
-  m_spawner.uninit();
-  writeMetadata();
-  m_worldStorage->unloadAll(true);
+    m_scriptContexts.clear();
+    m_spawner.uninit();
+    writeMetadata();
+    m_worldStorage->unloadAll(true);
+  } catch (std::exception const& e) {
+    Logger::warn("WorldServer: cleanup failed during destruction: {}", outputException(e, false));
+  } catch (...) {
+    Logger::warn("WorldServer: cleanup failed during destruction with unknown exception");
+  }
 
   // Hand the heap back for reuse. Per rpmalloc's contract this does NOT free
   // anything still allocated from it -- blocks that outlive the world stay

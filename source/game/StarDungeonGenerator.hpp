@@ -676,6 +676,7 @@ public:
 
   DungeonDefinitionConstPtr get(String const& name) const;
   JsonObject getMetadata(String const& name) const;
+  size_t clearCache() const;
 
 private:
   static DungeonDefinitionPtr readDefinition(String const& path);

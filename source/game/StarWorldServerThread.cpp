@@ -289,10 +289,9 @@ void WorldServerThread::run() {
     markError(std::move(error));
   }
 
-  // Destroy the WorldServer on THIS thread, the one that allocated it.
-  // rpmalloc defers cross-thread frees onto the owning heap; once this
-  // thread exits that heap is orphaned and those deferred lists are never
-  // drained -- measured as ~800MB kept after each outpost visit.
+  // Destroy the WorldServer here instead of later on UniverseServer. Most
+  // allocations made while a world runs belong to this rpmalloc thread heap,
+  // so freeing them before the thread exits lets its cache release the spans.
   RecursiveMutexLocker locker(m_mutex);
   if (!m_worldServer)
     return;

@@ -478,3 +478,49 @@ session notes ("cleanup-inventory").
 - Killing the driver's texture-bind redundancy at renderer level (risk/reward).
 - ResScale=2 on Ryujinx (worse at parked GPU clocks; reverted).
 - Host-side GPU clock pinning (needs root; PowerMizer ineffective on Wayland).
+
+## 10. August 2026 Switch OOM follow-up
+
+A hardware soak reached `ancientvault_fire` after several story worlds with
+blocks missing, then failed allocations and terminated while unloading the
+world. The last heartbeat reported 2.1 GiB used, but allocations as small as
+64 KiB failed with over 1 GiB aggregate free: the newlib heap was fragmented.
+
+Massif traced 419 MiB of ancient-vault generation to loaded tile-sector
+arrays. Every `WorldTile` kept space for four `CollisionBlock`s inline even
+though nearly all tiles cache zero or one. Using the existing
+`SmallList<CollisionBlock, 1>` preserves the four-block behavior while spilling
+only uncommon shapes. On x86-64 this reduced `WorldTile` 320 -> 168 bytes and
+`ServerTile` 352 -> 200 bytes. The same seeded 120-step vault benchmark dropped
+peak RSS from 2,420,644 to 2,066,388 KiB (-14.6%) and completed normally;
+fresh Ryujinx vault generation peaked at 1,793,114 KiB versus roughly 2.2 GiB
+in the hardware failure.
+
+The same investigation fixed two WIP diagnostics: ordinary C++ deletes now
+leave the allocation profile, and the live-world count increments only after
+successful construction. `WorldServer` destruction also catches best-effort
+cleanup failures so a storage error cannot escape its implicit `noexcept` and
+call `std::terminate`.
+
+Decoded dungeon definitions were the other large retained owner: the global
+64-entry cache kept each mission's full TMX arrays after construction. Instance
+creation now clears that cache, including its failure path, and parses dungeon
+parts sequentially so long-lived part allocations remain on the creating
+thread's heap. A Switch-only rpmalloc mapping pool obtains aligned memory from
+newlib in 16 MiB chunks, then address-sorts and coalesces released mappings.
+This preserves one-span reclamation without handing thousands of 64 KiB holes
+back to newlib. Its reserved high-water is reusable memory, not leaked live
+allocations.
+
+An unattended Ryujinx route crossed the Outpost, Erchius Mining Facility,
+Floran, Hylotl and Apex missions, a freshly generated ancient vault, then a
+second Outpost without `bad_alloc` or a failed span map. It reached 3.30 GiB of
+newlib arena after the largest missions, then reused that arena rather than
+growing or failing. A separate saved-vault replay exposed a null dereference in
+the async lighting worker during world teardown. Teardown now marks the world
+left before joining the worker and clears its queued-light flag; render also
+starts the worker only while in a world. Replaying the same save then loaded the
+vault with its blocks visible and sustained 60 FPS past the former crash point.
+The test autopilot also skips in-world cinematics so the Ruin route reaches the
+actual arena instead of waiting forever at “Esc to skip”; a targeted run drove
+115 entities, recovered to 49–56 FPS after loading, and peaked near 1.24 GiB.

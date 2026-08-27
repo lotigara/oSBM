@@ -530,12 +530,12 @@ WorldClientState& WorldClient::clientState() {
 }
 
 void WorldClient::render(WorldRenderData& renderData, unsigned bufferTiles) {
-  if (!m_lightingThread && m_asyncLighting)
-    m_lightingThread = Thread::invoke("WorldClient::lightingMain", mem_fn(&WorldClient::lightingMain), this);
-
   renderData.clear();
   if (!inWorld())
     return;
+
+  if (!m_lightingThread && m_asyncLighting)
+    m_lightingThread = Thread::invoke("WorldClient::lightingMain", mem_fn(&WorldClient::lightingMain), this);
 
   MemoryDomain memoryDomain(m_memoryHeap);
 
@@ -2350,6 +2350,7 @@ void WorldClient::initWorld(WorldStartPacket const& startPacket) {
 void WorldClient::clearWorld() {
   MemoryDomain memoryDomain(m_memoryHeap);
   bool wasInWorld = m_inWorld;
+  m_inWorld = false;
 
   if (m_lightingThread) {
     m_stopLightingThread = true;
@@ -2359,8 +2360,17 @@ void WorldClient::clearWorld() {
     }
     m_lightingThread.finish();
     m_lightingThread = {};
-    m_stopLightingThread = false;
   }
+
+  // A stopped worker may leave the last render queued. Do not let the next
+  // world's worker consume that request against torn-down world data.
+  {
+    MutexLocker prepLocker(m_lightMapPrepMutex);
+    m_pendingLightReady = false;
+    m_pendingLights.clear();
+    m_pendingParticleLights.clear();
+  }
+  m_stopLightingThread = false;
 
   if (m_entityMap) {
     while (m_entityMap->size() > 0) {
@@ -2373,7 +2383,6 @@ void WorldClient::clearWorld() {
 
   m_currentStep = 0;
   m_currentTime = 0;
-  m_inWorld = false;
   m_clientId.reset();
 
   m_interpolationTracker = InterpolationTracker();
@@ -2425,8 +2434,6 @@ void WorldClient::clearWorld() {
   m_requestedDrops.clear();
   m_startupHiddenEntities.clear();
   m_previewTiles.clear();
-  m_pendingLights.clear();
-  m_pendingParticleLights.clear();
   m_lightMap = Lightmap();
   m_pendingLightMap = Lightmap();
   m_samples.clear();

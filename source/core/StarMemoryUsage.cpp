@@ -12,6 +12,7 @@
 
 // Everything that is not one of the four special cases below reads /proc.
 #if defined(STAR_SYSTEM_SWITCH)
+#include <malloc.h>
 #include <switch.h>
 #elif defined(STAR_SYSTEM_MACOS) || defined(STAR_SYSTEM_IOS)
 #include <mach/mach.h>
@@ -183,7 +184,13 @@ uint64_t memoryReleaseAllocatorCaches() {
 
 uint64_t memoryReleaseThreadCaches() {
 #ifdef STAR_USE_RPMALLOC
-  return (uint64_t)rpmalloc_release_thread_caches();
+  uint64_t released = (uint64_t)rpmalloc_release_thread_caches();
+#ifdef STAR_SYSTEM_SWITCH
+  // Also return any unrelated free newlib top chunk. rpmalloc mappings stay
+  // in its coalescing pool so later worlds reuse them without fragmentation.
+  malloc_trim(0);
+#endif
+  return released;
 #else
   return 0;
 #endif

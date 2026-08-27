@@ -32,7 +32,7 @@ namespace {
   // Live sampled blocks. Sized so a session holding tens of millions of small
   // blocks still fits its 1/64 sample without the table saturating.
   size_t const PointerSlots = 1u << 17;
-  size_t const SiteSlots = 512;
+  size_t const SiteSlots = 4096;
 
   struct PointerSlot {
     std::atomic<uintptr_t> pointer{0};
@@ -79,9 +79,11 @@ namespace {
 
   uint32_t siteFor(uintptr_t returnAddress) {
     SiteSlot* sites = siteTable();
-    size_t h = (size_t)((returnAddress >> 2) * 2654435761u) % SiteSlots;
-    for (size_t probe = 0; probe < 32; ++probe) {
-      size_t idx = (h + probe) % SiteSlots;
+    // Slot zero is reserved for overflow, so exhaustion cannot attribute all
+    // later callers to whichever real allocation site happened to claim it.
+    size_t h = (size_t)((returnAddress >> 2) * 2654435761u) % (SiteSlots - 1);
+    for (size_t probe = 0; probe < 64; ++probe) {
+      size_t idx = 1 + (h + probe) % (SiteSlots - 1);
       uintptr_t current = sites[idx].returnAddress.load(std::memory_order_relaxed);
       if (current == returnAddress)
         return (uint32_t)idx;
@@ -223,10 +225,15 @@ void allocProfileReport(char* buffer, size_t bufferSize) {
 
     uintptr_t ra = sites[bestIdx].returnAddress.load(std::memory_order_relaxed);
     int64_t count = sites[bestIdx].liveCount.load(std::memory_order_relaxed);
-    int written = snprintf(buffer + used, bufferSize - used, " +%llx=%lldkB/%lldn",
-        (unsigned long long)(ra - base),
-        (long long)(bestBytes >> 10),
-        (long long)count);
+    int written;
+    if (bestIdx == 0)
+      written = snprintf(buffer + used, bufferSize - used, " overflow=%lldkB/%lldn",
+          (long long)(bestBytes >> 10), (long long)count);
+    else
+      written = snprintf(buffer + used, bufferSize - used, " +%llx=%lldkB/%lldn",
+          (unsigned long long)(ra - base),
+          (long long)(bestBytes >> 10),
+          (long long)count);
     if (written <= 0 || (size_t)written >= bufferSize - used)
       break;
     used += (size_t)written;

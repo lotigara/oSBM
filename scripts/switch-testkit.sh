@@ -91,7 +91,9 @@ write_flags() {
   if [[ -n "$scenario" ]]; then
     flag_body="$scenario"
   else
-    flag_body=$'warp=orbitedworld\ncycle=90\nscenario=orbitedworld,instanceworld:outpost,orbitedworld'
+    # One ~40 minute lap: planet, hub, every story mission, the Ruin boss,
+    # an ancient vault, and a space encounter. Then repeat until stopped.
+    flag_body=$'cycle=90\nscenario=orbitedworld,instanceworld:outpost,instanceworld:lunarbase,instanceworld:floranmission1,instanceworld:hylotlmission1,instanceworld:avianmission1,instanceworld:apexmission1,instanceworld:glitchmission1,instanceworld:penguinmission1,instanceworld:cultistmission1,instanceworld:tentaclemission=915.306,instanceworld:ancientvault_fire,instanceworld:spaceencounter\nsticky'
   fi
   local tmp; tmp="$(mktemp)"
   printf '%s\n' "$flag_body" > "$tmp"

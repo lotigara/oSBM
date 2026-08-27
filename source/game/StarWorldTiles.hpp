@@ -41,7 +41,10 @@ struct WorldTile {
   CollisionKind collision;
 
   bool collisionCacheDirty;
-  StaticList<CollisionBlock, CollisionGenerator::MaximumCollisionsPerSpace> collisionCache;
+  // Most tiles cache zero or one block. Keeping all four inline costs 232
+  // bytes in every tile, including the millions of empty tiles loaded while
+  // building large dungeons; spill only the uncommon multi-block shapes.
+  SmallList<CollisionBlock, 1> collisionCache;
 
   BiomeIndex blockBiomeIndex;
   BiomeIndex environmentBiomeIndex;

@@ -7,6 +7,7 @@
 #include "StarChatProcessor.hpp"
 #include "StarCommandProcessor.hpp"
 #include "StarConfiguration.hpp"
+#include "StarDungeonGenerator.hpp"
 #include "StarEncode.hpp"
 #include "StarFile.hpp"
 #include "StarJsonExtra.hpp"
@@ -2409,6 +2410,18 @@ Maybe<WorkerPoolPromise<WorldServerThreadPtr>> UniverseServer::instanceWorldProm
   auto storageDirectory = m_storageDirectory;
   auto universeClock = m_universeClock;
   return m_workerPool.addProducer<WorldServerThreadPtr>([this, storageDirectory, instanceWorldId, universeClock]() {
+    auto clearDungeonCache = []() noexcept {
+      try {
+        auto definitions = Root::singleton().dungeonDefinitions();
+        if (size_t count = definitions->clearCache())
+          Logger::info("UniverseServer: released {} cached dungeon definitions after instance-world creation", count);
+      } catch (...) {
+        // Best effort on an already failing allocation path.
+      }
+      memoryReleaseThreadCaches();
+    };
+    auto clearDungeonCacheOnFailure = finally([&clearDungeonCache]() { clearDungeonCache(); });
+
     Json worldConfig = Root::singleton().assets()->json("/instance_worlds.config").get(instanceWorldId.instance);
     uint64_t worldSeed;
     if (worldConfig.contains("seed"))
@@ -2516,6 +2529,12 @@ Maybe<WorkerPoolPromise<WorldServerThreadPtr>> UniverseServer::instanceWorldProm
     }
 
     worldServer->initLua(this);
+
+    // Definitions contain the full decoded TMX tile arrays. They are only
+    // needed while constructing an instance world; retaining every story
+    // mission made long warp sequences grow until newlib fragmented and OOMed.
+    clearDungeonCache();
+    clearDungeonCacheOnFailure.cancel();
 
     auto worldThread = make_shared<WorldServerThread>(worldServer, instanceWorldId);
     worldThread->setPause(m_pause);
